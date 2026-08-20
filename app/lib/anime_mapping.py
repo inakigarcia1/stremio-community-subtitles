@@ -119,9 +119,16 @@ def update_database():
     for entry in data:
         kitsu_id = entry.get('kitsu_id')
         mal_id = entry.get('mal_id')
-        imdb_id = entry.get('imdb_id')
-        tvdb_season = entry.get('season', {}).get('tvdb') if entry.get('season') else None
-        
+        imdb_raw = entry.get('imdb_id')
+        if isinstance(imdb_raw, list):
+            imdb_id = imdb_raw[0] if imdb_raw else None
+        else:
+            imdb_id = imdb_raw
+        season = entry.get('season')
+        tvdb_season = season.get('tvdb') if isinstance(season, dict) else None
+        if isinstance(tvdb_season, list):
+            tvdb_season = tvdb_season[0] if tvdb_season else None
+
         if kitsu_id or mal_id:
             cursor.execute(
                 'INSERT OR REPLACE INTO anime_mapping (kitsu_id, mal_id, imdb_id, tvdb_season) VALUES (?, ?, ?, ?)',

@@ -163,7 +163,16 @@ async def account_settings():
     async with async_session_maker() as session:
         result = await session.execute(select(User).filter_by(id=user_id))
         user = result.scalar_one_or_none()
-        
+
+        if not user:
+            current_app.logger.warning(
+                "Authenticated session references missing user id=%s; forcing logout",
+                user_id,
+            )
+            await logout_user()
+            await flash(_('Your session is no longer valid. Please log in again.'), 'warning')
+            return redirect(url_for('auth.login'))
+
         current_app.logger.info(f"Creating form for user {user_id}")
         lang_form = await LanguagePreferenceForm.create_form(prefix="lang_form")
         lang_form.preferred_languages.choices = LANGUAGES
