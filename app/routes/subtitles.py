@@ -29,6 +29,7 @@ except ImportError:
 from ..extensions import async_session_maker
 from ..models import User, Subtitle, UserActivity, UserSubtitleSelection, SubtitleVote  
 from ..lib.subtitles import convert_to_vtt
+from ..lib.service_user import get_service_user
 from .utils import respond_with, get_active_subtitle_details, respond_with_no_cache, NoCacheResponse, no_cache_redirect, get_vtt_content, generate_vtt_message, sanitize_filename
 from urllib.parse import parse_qs, unquote
 import gzip
@@ -39,6 +40,17 @@ import aiofiles
 subtitles_bp = Blueprint('subtitles', __name__)
 
 
+@subtitles_bp.route('/subtitles/<content_type>/<content_id>.json')
+@subtitles_bp.route('/subtitles/<content_type>/<content_id>/<path:params>')
+async def service_addon_stream(content_type: str, content_id: str, params: str = None):
+    """Tokenless subtitle search for the internal Apachiy service user."""
+    user = await get_service_user()
+    if not user:
+        current_app.logger.warning("Subtitle request without service user configured")
+        return respond_with_no_cache({'subtitles': []})
+    return await _handle_addon_stream(user, content_type, content_id, params, manifest_token=None)
+
+
 @subtitles_bp.route('/<manifest_token>/subtitles/<content_type>/<content_id>/<params>.json')
 @subtitles_bp.route('/<manifest_token>/subtitles/<content_type>/<content_id>/<path:params>')
 @subtitles_bp.route('/<manifest_token>/subtitles/<content_type>/<content_id>.json')
@@ -47,11 +59,14 @@ async def addon_stream(manifest_token: str, content_type: str, content_id: str, 
     Handles the subtitle request from Stremio using the user's manifest token.
     Generates an encoded identifier for the download URL.
     """
-    # Find user by manifest token
     user = await User.get_by_manifest_token(manifest_token)
     if not user:
         current_app.logger.warning(f"Subtitle request with invalid token: {manifest_token}")
         return respond_with_no_cache({'subtitles': []})
+    return await _handle_addon_stream(user, content_type, content_id, params, manifest_token=manifest_token)
+
+
+async def _handle_addon_stream(user, content_type: str, content_id: str, params: str = None, manifest_token: str = None):
 
 
 
@@ -233,7 +248,9 @@ async def addon_stream(manifest_token: str, content_type: str, content_id: str, 
                 if active_providers:
                     search_params = {
                         'imdb_id': imdb_id,
+                        'content_id': content_id,
                         'video_hash': video_hash,
+                        'video_size': video_size,
                         'languages': preferred_langs,
                         'season': season,
                         'episode': episode,
@@ -287,11 +304,17 @@ async def addon_stream(manifest_token: str, content_type: str, content_id: str, 
             if len(subtitle_name) > 80:
                 subtitle_name = subtitle_name[:80]
             
-            download_url = url_for('subtitles.unified_download',
-                                   manifest_token=manifest_token,
-                                   download_identifier=download_identifier,
-                                   _external=True,
-                                   _scheme=current_app.config['PREFERRED_URL_SCHEME'])
+            if manifest_token:
+                download_url = url_for('subtitles.unified_download',
+                                       manifest_token=manifest_token,
+                                       download_identifier=download_identifier,
+                                       _external=True,
+                                       _scheme=current_app.config['PREFERRED_URL_SCHEME'])
+            else:
+                download_url = url_for('subtitles.service_unified_download',
+                                       download_identifier=download_identifier,
+                                       _external=True,
+                                       _scheme=current_app.config['PREFERRED_URL_SCHEME'])
             stremio_sub_id = f"{subtitle_name}_{preferred_lang}"
             
             vtt_entry = {
@@ -362,6 +385,16 @@ async def addon_stream(manifest_token: str, content_type: str, content_id: str, 
     return respond_with_no_cache({'subtitles': subtitles_list})
 
 
+@subtitles_bp.route('/download/<download_identifier>.ass')
+@subtitles_bp.route('/download/<download_identifier>.vtt')
+async def service_unified_download(download_identifier: str):
+    user = await get_service_user()
+    if not user:
+        current_app.logger.warning("Download request without service user configured")
+        return NoCacheResponse(generate_vtt_message("Service user not configured"), status=503, mimetype='text/vtt')
+    return await _unified_download_for_user(user, download_identifier)
+
+
 @subtitles_bp.route('/<manifest_token>/download/<download_identifier>.ass')
 @subtitles_bp.route('/<manifest_token>/download/<download_identifier>.vtt')
 async def unified_download(manifest_token: str, download_identifier: str):
@@ -369,6 +402,10 @@ async def unified_download(manifest_token: str, download_identifier: str):
     if not user:
         current_app.logger.warning(f"Download request with invalid token: {manifest_token}")
         return NoCacheResponse(generate_vtt_message("Invalid Access Token"), status=403, mimetype='text/vtt')
+    return await _unified_download_for_user(user, download_identifier)
+
+
+async def _unified_download_for_user(user, download_identifier: str):
 
     # Check if ASS format is requested from request path
     is_ass_request = request.path.endswith('.ass')

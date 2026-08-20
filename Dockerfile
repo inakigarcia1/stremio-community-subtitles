@@ -43,9 +43,16 @@ elif [ -d /app/_bundled_anime_lists ]; then\n\
     cp -r /app/_bundled_anime_lists/* /app/data/anime-lists/\n\
   fi\n\
 fi\n\
+if [ "${BOOTSTRAP_ON_START:-true}" = "true" ]; then\n\
+  echo "[entrypoint] Running database bootstrap..."\n\
+  python run.py init-db || true\n\
+  python run.py create-roles || true\n\
+  python run.py init-anime-db || true\n\
+  python ops/bootstrap_service_user.py || true\n\
+fi\n\
 exec "$@"\n' > /app/entrypoint.sh && chmod +x /app/entrypoint.sh
 
 ENTRYPOINT ["/app/entrypoint.sh"]
 
-# Run with Hypercorn (workers = CPU cores)
-CMD ["hypercorn", "run:app", "--bind", "0.0.0.0:4949", "--workers", "4", "--backlog", "256"]
+# Run with Hypercorn (single worker default for Apachiy stack)
+CMD ["hypercorn", "run:app", "--bind", "0.0.0.0:4949", "--workers", "1", "--backlog", "256"]
