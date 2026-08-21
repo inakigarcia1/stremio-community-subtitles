@@ -109,7 +109,11 @@ def bootstrap_service_user_command():
     """Create or update the internal Apachiy service user."""
     from ops.bootstrap_service_user import bootstrap
 
-    asyncio.run(bootstrap())
+    async def _run():
+        async with app.app_context():
+            await bootstrap()
+
+    asyncio.run(_run())
 
 
 if __name__ == '__main__':

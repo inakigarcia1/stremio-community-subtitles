@@ -15,6 +15,21 @@ from iso639 import Lang
 auth_bp = Blueprint('auth', __name__)
 
 
+async def get_authenticated_db_user(db_session):
+    """Return the DB user for the current session, or clear stale auth."""
+    uid = current_user.auth_id
+    result = await db_session.execute(select(User).filter_by(id=uid))
+    user = result.scalar_one_or_none()
+    if user is None:
+        current_app.logger.warning(
+            "Authenticated session references missing user id=%s; forcing logout",
+            uid,
+        )
+        logout_user()
+        session.clear()
+    return user
+
+
 @auth_bp.route('/login', methods=['GET', 'POST'])
 async def login():
     if await current_user.is_authenticated:

@@ -39,11 +39,15 @@ async def bootstrap():
                 email_confirmed=True,
                 preferred_languages=list(DEFAULT_LANGS),
             )
-            user.set_password(secrets.token_urlsafe(32))
+            service_password = _env("APACHIY_SERVICE_PASSWORD")
+            user.set_password(service_password or secrets.token_urlsafe(32))
             user.generate_manifest_token()
             session.add(user)
             await session.flush()
         else:
+            service_password = _env("APACHIY_SERVICE_PASSWORD")
+            if service_password:
+                user.set_password(service_password)
             if not user.preferred_languages:
                 user.preferred_languages = list(DEFAULT_LANGS)
             if not user.manifest_token:
@@ -103,5 +107,10 @@ async def bootstrap():
 
 
 if __name__ == "__main__":
-    create_app()
-    asyncio.run(bootstrap())
+    app = create_app()
+
+    async def _run():
+        async with app.app_context():
+            await bootstrap()
+
+    asyncio.run(_run())

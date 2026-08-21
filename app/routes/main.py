@@ -14,6 +14,7 @@ from ..providers.registry import ProviderRegistry
 from ..lib.metadata import get_metadata
 from ..extensions import async_session_maker
 from ..languages import LANGUAGES, LANGUAGE_DICT
+from .auth import get_authenticated_db_user
 from .utils import check_opensubtitles_token
 
 main_bp = Blueprint('main', __name__)
@@ -141,9 +142,10 @@ async def account_settings():
         try:
             data = await request.get_json()
             async with async_session_maker() as session:
-                result = await session.execute(select(User).filter_by(id=user_id))
-                user = result.scalar_one_or_none()
-                
+                user = await get_authenticated_db_user(session)
+                if not user:
+                    return {'success': False, 'error': 'Session expired'}, 401
+
                 if 'show_no_subtitles' in data:
                     user.show_no_subtitles = data.get('show_no_subtitles', False)
                     await session.commit()
@@ -161,15 +163,8 @@ async def account_settings():
             return {'success': False, 'error': str(e)}, 500
     
     async with async_session_maker() as session:
-        result = await session.execute(select(User).filter_by(id=user_id))
-        user = result.scalar_one_or_none()
-
+        user = await get_authenticated_db_user(session)
         if not user:
-            current_app.logger.warning(
-                "Authenticated session references missing user id=%s; forcing logout",
-                user_id,
-            )
-            await logout_user()
             await flash(_('Your session is no longer valid. Please log in again.'), 'warning')
             return redirect(url_for('auth.login'))
 

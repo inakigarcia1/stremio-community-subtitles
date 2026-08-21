@@ -175,6 +175,11 @@ def create_app():
                         'selections_count': row[2] or 0,
                         'votes_count': row[3] or 0,
                     }
+
+                from quart_auth import logout_user
+                from quart import session as quart_session
+                logout_user()
+                quart_session.clear()
         return {'user': None, 'uploaded_count': 0, 'selections_count': 0, 'votes_count': 0}
     
     @app.context_processor

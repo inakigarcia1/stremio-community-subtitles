@@ -8,6 +8,7 @@ from ..extensions import async_session_maker
 from ..models import User, UserActivity, Subtitle, UserSubtitleSelection, SubtitleVote
 from ..providers.registry import ProviderRegistry
 from ..providers.base import ProviderAuthError
+from .auth import get_authenticated_db_user
 import datetime
 
 providers_bp = Blueprint('providers', __name__, url_prefix='/providers')
@@ -33,9 +34,11 @@ async def connect_provider(provider_name):
         try_provide_ass = credentials.pop('try_provide_ass', 'false') == 'true'
         
         async with async_session_maker() as session:
-            result = await session.execute(select(User).filter_by(id=user_id))
-            user = result.scalar_one_or_none()
-            
+            user = await get_authenticated_db_user(session)
+            if not user:
+                await flash(_('Your session is no longer valid. Please log in again.'), 'warning')
+                return redirect(url_for('auth.login'))
+
             # Check if already authenticated and only updating settings
             if await provider.is_authenticated(user) and not credentials:
                 # Only update try_provide_ass setting
@@ -79,9 +82,11 @@ async def disconnect_provider(provider_name):
     
     try:
         async with async_session_maker() as session:
-            result = await session.execute(select(User).filter_by(id=user_id))
-            user = result.scalar_one_or_none()
-            
+            user = await get_authenticated_db_user(session)
+            if not user:
+                await flash(_('Your session is no longer valid. Please log in again.'), 'warning')
+                return redirect(url_for('auth.login'))
+
             await provider.logout(user)
             
             if hasattr(user, 'provider_credentials') and user.provider_credentials:
