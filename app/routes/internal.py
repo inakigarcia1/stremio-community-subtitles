@@ -9,9 +9,9 @@ INTERNAL_TOKEN = os.environ.get('INTERNAL_API_TOKEN', '')
 
 
 def _check_token():
-    """Verify request comes with valid internal token."""
+    """Verify request comes with valid internal token (or allow when unset for self-host)."""
     if not INTERNAL_TOKEN:
-        return False
+        return True
     token = request.headers.get('X-Internal-Token', '')
     return token == INTERNAL_TOKEN
 
@@ -25,5 +25,25 @@ async def reload_anime():
     try:
         updated = update_database()
         return jsonify({'updated': updated}), 200
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@internal_bp.route('/clear-cache', methods=['POST'])
+async def clear_cache():
+    """Clear provider search disk cache and in-memory app caches."""
+    if not _check_token():
+        return jsonify({'error': 'unauthorized'}), 403
+
+    from ..lib.provider_search_cache import clear_provider_search_cache
+    from ..extensions import cache
+
+    try:
+        removed_files = clear_provider_search_cache()
+        cache.clear()
+        return jsonify({
+            'provider_search_files_removed': removed_files,
+            'in_memory_cache_cleared': True,
+        }), 200
     except Exception as e:
         return jsonify({'error': str(e)}), 500

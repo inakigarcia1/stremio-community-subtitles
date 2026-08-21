@@ -649,25 +649,30 @@ async def _unified_download_for_user(user, download_identifier: str):
         # Regular URL download
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.get(provider_subtitle_url, timeout=aiohttp.ClientTimeout(total=5)) as r:
+                async with session.get(provider_subtitle_url, timeout=aiohttp.ClientTimeout(total=30)) as r:
                     r.raise_for_status()
-                    
+                    body = await r.read()
+
                     # Check if response is ZIP (SubDL URLs often end with .zip?api_key=...)
                     content_type = r.headers.get('Content-Type', '')
                     url_path = provider_subtitle_url.split('?', 1)[0].lower()
                     is_zip_response = (
                         'zip' in content_type.lower()
                         or url_path.endswith('.zip')
+                        or (len(body) >= 2 and body[:2] == b'PK')
                     )
                     if is_zip_response:
                         from .utils import extract_subtitle_from_zip, process_subtitle_content
                         
                         try:
-                            # Extract subtitle from ZIP
-                            zip_data = await r.read()
-                            current_app.logger.info(f"Downloaded ZIP from {provider_subtitle_url}, size={len(zip_data)}, first_bytes={zip_data[:20].hex() if len(zip_data) >= 20 else zip_data.hex()}")
+                            zip_data = body
+                            current_app.logger.info(
+                                f"Downloaded ZIP from {provider_subtitle_url}, "
+                                f"size={len(zip_data)}, "
+                                f"first_bytes={zip_data[:20].hex() if len(zip_data) >= 20 else zip_data.hex()}"
+                            )
                             subtitle_content, filename, extension = extract_subtitle_from_zip(zip_data, episode=episode)
-                            del zip_data  # Free memory
+                            del zip_data
                             
                             # Process subtitle (convert to VTT, handle ASS)
                             processed = await process_subtitle_content(subtitle_content, extension)
@@ -688,7 +693,7 @@ async def _unified_download_for_user(user, download_identifier: str):
                                 current_app.logger.warning(f"Provider archive contains no subtitle files (url={provider_subtitle_url}): {e}")
                                 message_key = 'provider_no_subtitle_in_archive'
                             else:
-                                current_app.logger.error(f"Error processing ZIP subtitle (url={provider_subtitle_url}, content_type={content_type}, response_size={len(await r.read())}): {e}", exc_info=True)
+                                current_app.logger.error(f"Error processing ZIP subtitle (url={provider_subtitle_url}, content_type={content_type}, response_size={len(body)}): {e}", exc_info=True)
                                 message_key = 'error'
                         except Exception as e:
                             current_app.logger.error(f"Error processing ZIP subtitle (url={provider_subtitle_url}, content_type={content_type}): {e}", exc_info=True)
@@ -696,9 +701,10 @@ async def _unified_download_for_user(user, download_identifier: str):
                     else:
                         # Plain text subtitle (VTT/SRT)
                         if is_ass_request:
-                            # ASS requested but provider returned plain text - serve as VTT
-                            current_app.logger.info(f"ASS requested but provider returned plain text, serving as VTT")
-                        vtt_content = await r.text()
+                            current_app.logger.info(
+                                "ASS requested but provider returned plain text, serving as VTT"
+                            )
+                        vtt_content = body.decode('utf-8', errors='replace')
         except asyncio.TimeoutError:
             current_app.logger.warning(f"Timeout fetching subtitle from {provider_subtitle_url}")
             message_key = 'provider_timeout'

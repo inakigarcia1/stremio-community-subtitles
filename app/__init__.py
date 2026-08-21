@@ -114,6 +114,7 @@ def create_app():
     app.register_blueprint(providers_bp)
     app.register_blueprint(language_bp)
     app.register_blueprint(internal_bp)
+    csrf.exempt(internal_bp)
 
     @app.errorhandler(413)
     async def request_entity_too_large(error):

@@ -201,6 +201,13 @@ If you run your own deployment pipeline and want to update anime mappings withou
         -H "X-Internal-Token: $(grep INTERNAL_API_TOKEN .env | cut -d= -f2)"
    ```
 
+3. Clear provider search cache and in-memory metadata cache:
+   ```bash
+   curl -X POST http://localhost:4949/internal/clear-cache \
+        -H "X-Internal-Token: $(grep INTERNAL_API_TOKEN .env | cut -d= -f2)"
+   ```
+   When `INTERNAL_API_TOKEN` is unset, internal endpoints accept requests without a token (self-host only).
+
 > Block `/internal/*` from external access in your reverse proxy.
 
 ## Production Deployment

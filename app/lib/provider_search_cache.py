@@ -127,3 +127,19 @@ def merge_and_store(
         json.dump(stored, f)
     os.replace(tmp, path)
     return merged
+
+
+def clear_provider_search_cache() -> int:
+    """Delete all on-disk provider search cache files. Returns removed file count."""
+    cache_dir = _cache_dir()
+    removed = 0
+    for name in os.listdir(cache_dir):
+        if not name.endswith(".json"):
+            continue
+        path = os.path.join(cache_dir, name)
+        try:
+            os.remove(path)
+            removed += 1
+        except OSError:
+            pass
+    return removed
