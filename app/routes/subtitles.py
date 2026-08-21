@@ -652,9 +652,14 @@ async def _unified_download_for_user(user, download_identifier: str):
                 async with session.get(provider_subtitle_url, timeout=aiohttp.ClientTimeout(total=5)) as r:
                     r.raise_for_status()
                     
-                    # Check if response is ZIP (SubDL returns ZIP files)
+                    # Check if response is ZIP (SubDL URLs often end with .zip?api_key=...)
                     content_type = r.headers.get('Content-Type', '')
-                    if 'zip' in content_type.lower() or provider_subtitle_url.endswith('.zip'):
+                    url_path = provider_subtitle_url.split('?', 1)[0].lower()
+                    is_zip_response = (
+                        'zip' in content_type.lower()
+                        or url_path.endswith('.zip')
+                    )
+                    if is_zip_response:
                         from .utils import extract_subtitle_from_zip, process_subtitle_content
                         
                         try:
@@ -704,6 +709,9 @@ async def _unified_download_for_user(user, download_identifier: str):
         except Exception as e:
             current_app.logger.error(f"Unexpected error fetching subtitle: {e}")
             message_key = 'error'
+            if provider_subtitle_to_serve:
+                failed_provider_name = provider_subtitle_to_serve.get('provider')
+                failed_provider_error = str(e)
 
     if vtt_content:
         if not vtt_content.strip().upper().startswith("WEBVTT"):
