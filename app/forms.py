@@ -8,8 +8,31 @@ from .languages import LANGUAGES
 from quart_babel import lazy_gettext as _l
 
 
+class InternalEmail:
+    """Accept normal emails and internal service addresses such as apachiy@local."""
+
+    def __init__(self, message=None):
+        self.message = message or _l('Invalid email address.')
+
+    def __call__(self, form, field):
+        value = (field.data or '').strip()
+        if not value or '@' not in value:
+            raise ValidationError(self.message)
+
+        local, domain = value.rsplit('@', 1)
+        if not local or not domain:
+            raise ValidationError(self.message)
+
+        try:
+            Email()(form, field)
+        except ValidationError:
+            if '.' not in domain:
+                return
+            raise ValidationError(self.message)
+
+
 class LoginForm(QuartForm):
-    email = StringField(_l('Email'), validators=[DataRequired(), Email()])
+    email = StringField(_l('Email'), validators=[DataRequired(), InternalEmail()])
     password = PasswordField(_l('Password'), validators=[DataRequired()])
     remember_me = BooleanField(_l('Remember Me'))
     submit = SubmitField(_l('Sign In'))
@@ -131,7 +154,7 @@ class ChangePasswordForm(QuartForm):
 
 
 class ResetPasswordRequestForm(QuartForm):
-    email = StringField(_l('Email'), validators=[DataRequired(), Email()])
+    email = StringField(_l('Email'), validators=[DataRequired(), InternalEmail()])
     submit = SubmitField(_l('Request Password Reset'))
 
 
