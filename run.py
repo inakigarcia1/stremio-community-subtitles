@@ -103,9 +103,24 @@ def init_anime_db_command():
     else:
         click.echo("✓ Anime mapping database already up to date")
 
+
+@cli.command('bootstrap-service-user')
+def bootstrap_service_user_command():
+    """Create or update the internal Apachiy service user."""
+    from ops.bootstrap_service_user import bootstrap
+
+    asyncio.run(bootstrap())
+
+
 if __name__ == '__main__':
     # Check if running CLI commands
-    if len(sys.argv) > 1 and sys.argv[1] in ['create-admin', 'init-db', 'create-roles', 'init-anime-db']:
+    if len(sys.argv) > 1 and sys.argv[1] in [
+        'create-admin',
+        'init-db',
+        'create-roles',
+        'init-anime-db',
+        'bootstrap-service-user',
+    ]:
         cli()
         sys.exit(0)
     

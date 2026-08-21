@@ -48,7 +48,7 @@ if [ "${BOOTSTRAP_ON_START:-true}" = "true" ]; then\n\
   python run.py init-db || true\n\
   python run.py create-roles || true\n\
   python run.py init-anime-db || true\n\
-  PYTHONPATH=/app python ops/bootstrap_service_user.py || true\n\
+  python run.py bootstrap-service-user || true\n\
 fi\n\
 exec "$@"\n' > /app/entrypoint.sh && chmod +x /app/entrypoint.sh
 

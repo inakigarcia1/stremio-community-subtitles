@@ -4,10 +4,11 @@ import asyncio
 import os
 import secrets
 
-from sqlalchemy import select
+from sqlalchemy import insert, select
+from sqlalchemy.orm import selectinload
 
-from app.extensions import async_session_maker
-from app.models import User, Role
+from app import create_app
+from app.models import User, Role, roles_users
 
 
 SERVICE_USERNAME = "apachiy"
@@ -20,8 +21,14 @@ def _env(name: str) -> str:
 
 
 async def bootstrap():
+    from app.extensions import async_session_maker
+
     async with async_session_maker() as session:
-        result = await session.execute(select(User).filter_by(username=SERVICE_USERNAME))
+        result = await session.execute(
+            select(User)
+            .filter_by(username=SERVICE_USERNAME)
+            .options(selectinload(User.roles))
+        )
         user = result.scalar_one_or_none()
 
         if not user:
@@ -46,35 +53,55 @@ async def bootstrap():
 
         subdl_key = _env("SUBDL_API_KEY")
         if subdl_key:
-            creds["subdl"] = {"api_key": subdl_key}
+            creds["subdl"] = {"api_key": subdl_key, "active": True}
 
         subsource_key = _env("SUBSOURCE_API_KEY")
         if subsource_key:
-            creds["subsource"] = {"api_key": subsource_key}
+            creds["subsource"] = {"api_key": subsource_key, "active": True}
 
         os_api_key = _env("OPENSUBTITLES_API_KEY")
         os_user = _env("OPENSUBTITLES_USERNAME")
         os_pass = _env("OPENSUBTITLES_PASSWORD")
-        if os_api_key or (os_user and os_pass):
-            os_creds = creds.get("opensubtitles", {})
-            if os_api_key:
-                os_creds["api_key"] = os_api_key
-            if os_user:
-                os_creds["username"] = os_user
-            if os_pass:
-                os_creds["password"] = os_pass
-            creds["opensubtitles"] = os_creds
+        if os_user and os_pass:
+            from app.providers.registry import ProviderRegistry
+
+            os_provider = ProviderRegistry.get("opensubtitles")
+            if os_provider:
+                try:
+                    creds["opensubtitles"] = await os_provider.authenticate(
+                        user,
+                        {"username": os_user, "password": os_pass},
+                    )
+                except Exception as exc:
+                    print(f"Warning: OpenSubtitles bootstrap auth failed: {exc}")
+            elif os_api_key:
+                creds["opensubtitles"] = {
+                    "api_key": os_api_key,
+                    "username": os_user,
+                    "password": os_pass,
+                    "active": True,
+                }
+        elif os_api_key:
+            # API key alone is read from app config at request time; keep a marker cred.
+            creds["opensubtitles"] = {"api_key": os_api_key}
 
         user.provider_credentials = creds
 
         role_result = await session.execute(select(Role).filter_by(name="User"))
         role = role_result.scalar_one_or_none()
-        if role and role not in user.roles:
-            user.roles.append(role)
+        if role:
+            existing_link = await session.execute(
+                select(roles_users).filter_by(user_id=user.id, role_id=role.id)
+            )
+            if existing_link.first() is None:
+                await session.execute(
+                    insert(roles_users).values(user_id=user.id, role_id=role.id)
+                )
 
         await session.commit()
         print(f"Service user '{SERVICE_USERNAME}' ready (manifest_token={user.manifest_token})")
 
 
 if __name__ == "__main__":
+    create_app()
     asyncio.run(bootstrap())
