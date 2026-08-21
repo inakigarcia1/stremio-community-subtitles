@@ -892,6 +892,27 @@ def generate_vtt_message(message: str) -> str:
     return f"WEBVTT\n\n00:00:00.000 --> 00:00:08.000\n{message}"
 
 
+def wrap_stremio_subtitle_url(url: str) -> str:
+    """Optional Stremio desktop proxy (11470). Off by default — breaks mobile clients."""
+    if os.environ.get('STREMIO_PROXY_SUBTITLE_URLS', 'false').lower() not in ('true', '1', 'yes'):
+        return url
+    from urllib.parse import quote
+    return f'http://127.0.0.1:11470/subtitles.vtt?from={quote(url, safe="")}'
+
+
+def prepare_vtt_for_response(vtt_content: str) -> tuple[bytes, str]:
+    """Return VTT body bytes and Content-Type for HTTP responses."""
+    from ..lib.subtitles import encode_vtt_for_http
+    return encode_vtt_for_http(vtt_content)
+
+
+def make_vtt_response(vtt_content: str, **kwargs) -> NoCacheResponse:
+    body, content_type = prepare_vtt_for_response(vtt_content)
+    response = NoCacheResponse(body, **kwargs)
+    response.headers['Content-Type'] = content_type
+    return response
+
+
 def extract_subtitle_from_zip(zip_content: bytes, episode: int = None):
     """
     Extracts subtitle file from ZIP or RAR archive.
@@ -999,7 +1020,6 @@ async def process_subtitle_content(content: bytes, extension: str, encoding=None
     """
     from ..lib.subtitles import convert_to_vtt
     
-    # Convert to VTT
     vtt_content = await convert_to_vtt(content, extension.lstrip('.'), encoding=encoding)
     
     # If ASS/SSA, also keep original
