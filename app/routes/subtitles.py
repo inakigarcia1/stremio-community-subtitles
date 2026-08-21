@@ -28,10 +28,9 @@ except ImportError:
     CLOUDINARY_AVAILABLE = False
 from ..extensions import async_session_maker
 from ..models import User, Subtitle, UserActivity, UserSubtitleSelection, SubtitleVote  
-from ..lib.subtitles import convert_to_vtt
+from ..lib.subtitles import convert_to_vtt, normalize_vtt_for_players
 from ..lib.service_user import get_service_user
-from ..lib.subtitles import decode_subtitle_bytes
-from .utils import respond_with, get_active_subtitle_details, respond_with_no_cache, NoCacheResponse, no_cache_redirect, get_vtt_content, generate_vtt_message, sanitize_filename, make_vtt_response, prepare_vtt_for_response, wrap_stremio_subtitle_url
+from .utils import respond_with, get_active_subtitle_details, respond_with_no_cache, NoCacheResponse, no_cache_redirect, get_vtt_content, generate_vtt_message, sanitize_filename
 from urllib.parse import parse_qs, unquote
 import gzip
 import io
@@ -316,7 +315,6 @@ async def _handle_addon_stream(user, content_type: str, content_id: str, params:
                                        download_identifier=download_identifier,
                                        _external=True,
                                        _scheme=current_app.config['PREFERRED_URL_SCHEME'])
-            download_url = wrap_stremio_subtitle_url(download_url)
             stremio_sub_id = f"{subtitle_name}_{preferred_lang}"
             
             vtt_entry = {
@@ -393,7 +391,7 @@ async def service_unified_download(download_identifier: str):
     user = await get_service_user()
     if not user:
         current_app.logger.warning("Download request without service user configured")
-        return make_vtt_response(generate_vtt_message("Service user not configured"), status=503)
+        return NoCacheResponse(generate_vtt_message("Service user not configured"), status=503, mimetype='text/vtt')
     return await _unified_download_for_user(user, download_identifier)
 
 
@@ -403,7 +401,7 @@ async def unified_download(manifest_token: str, download_identifier: str):
     user = await User.get_by_manifest_token(manifest_token)
     if not user:
         current_app.logger.warning(f"Download request with invalid token: {manifest_token}")
-        return make_vtt_response(generate_vtt_message("Invalid Access Token"), status=403)
+        return NoCacheResponse(generate_vtt_message("Invalid Access Token"), status=403, mimetype='text/vtt')
     return await _unified_download_for_user(user, download_identifier)
 
 
@@ -457,7 +455,7 @@ async def _unified_download_for_user(user, download_identifier: str):
             raise ValueError("Missing content_id in decoded context")
     except Exception as e:
         current_app.logger.error(f"Failed to decode download identifier '{download_identifier}': {e}")
-        return make_vtt_response(generate_vtt_message("Invalid download link."), status=400)
+        return NoCacheResponse(generate_vtt_message("Invalid download link."), status=400, mimetype='text/vtt')
 
     # Use the utility function to get active subtitle details (now with OpenSubtitles fallback)
     active_subtitle_info = await get_active_subtitle_details(user, content_id, video_hash, content_type, video_filename, lang, season, episode)
@@ -706,7 +704,7 @@ async def _unified_download_for_user(user, download_identifier: str):
                             current_app.logger.info(
                                 "ASS requested but provider returned plain text, serving as VTT"
                             )
-                        vtt_content = decode_subtitle_bytes(body)
+                        vtt_content = body.decode('utf-8', errors='replace')
         except asyncio.TimeoutError:
             current_app.logger.warning(f"Timeout fetching subtitle from {provider_subtitle_url}")
             message_key = 'provider_timeout'
@@ -722,10 +720,11 @@ async def _unified_download_for_user(user, download_identifier: str):
                 failed_provider_error = str(e)
 
     if vtt_content:
+        vtt_content = normalize_vtt_for_players(vtt_content)
         if not vtt_content.strip().upper().startswith("WEBVTT"):
             current_app.logger.warning("Content served is not VTT, serving as plain text")
             return NoCacheResponse(vtt_content, mimetype='text/plain')
-        return make_vtt_response(vtt_content)
+        return NoCacheResponse(vtt_content, mimetype='text/vtt')
 
     # Fallback messages
     if not message_key:
@@ -743,7 +742,7 @@ async def _unified_download_for_user(user, download_identifier: str):
     }
     message_text = messages.get(message_key, "An error occurred or subtitles need selection.")
     current_app.logger.info(f"Serving placeholder message (key: '{message_key}', provider: '{failed_provider_name}') for context: {context}")
-    return make_vtt_response(generate_vtt_message(message_text))
+    return NoCacheResponse(generate_vtt_message(message_text), mimetype='text/vtt')
 
 
 @subtitles_bp.route('/content/<uuid:activity_id>/upload', methods=['GET', 'POST'])
@@ -1779,14 +1778,8 @@ async def download_subtitle(subtitle_id):
     elif subtitle.file_path:  # Community subtitle (local or cloudinary)
         try:
             vtt_content = await get_vtt_content(subtitle)
-            body, content_type = prepare_vtt_for_response(vtt_content)
-            return Response(
-                body,
-                headers={
-                    'Content-Type': content_type,
-                    'Content-Disposition': f'attachment;filename={download_filename}',
-                },
-            )
+            return Response(vtt_content, mimetype='text/vtt',
+                            headers={"Content-Disposition": f"attachment;filename={download_filename}"})
         except Exception as e:
             current_app.logger.error(f"Error downloading subtitle file {subtitle.file_path}: {e}", exc_info=True)
             abort(500)

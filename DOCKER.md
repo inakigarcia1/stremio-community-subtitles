@@ -210,13 +210,6 @@ If you run your own deployment pipeline and want to update anime mappings withou
 
 > Block `/internal/*` from external access in your reverse proxy.
 
-### Stremio subtitle encoding (mojibake)
-
-If subtitles look correct when downloaded but show `Â¿` / `Ã¡` in Stremio, the player is
-mis-detecting UTF-8 as ISO-8859-1. The addon defaults to `VTT_RESPONSE_ENCODING=cp1252`
-for Western European languages. Set `VTT_RESPONSE_ENCODING=utf-8` if you need UTF-8 files
-for other tools instead.
-
 ## Production Deployment
 
 For production, use a reverse proxy (nginx/Caddy) in front of the application.
