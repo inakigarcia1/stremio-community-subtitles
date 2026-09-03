@@ -50,7 +50,8 @@ click==8.3.1
 dacite==1.9.2
 python-dateutil==2.9.0.post0
 six==1.17.0
-rapidfuzz==3.10.1
+ffsubsync==0.5.1
+pytest==8.3.5
 logtail-python==0.2.10
 cachelib==0.9.0
 resend==2.15.0

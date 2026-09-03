@@ -409,7 +409,9 @@ async def get_active_subtitle_details(user, content_id, video_hash=None, content
                 'type': 'local',
                 'subtitle': local_sub,
                 'auto': True,
-                'user_vote_value': await _get_user_vote(user, local_sub.id)
+                'user_vote_value': await _get_user_vote(user, local_sub.id),
+                'match_kind': 'local_hash',
+                'filename_score': None,
             })
             elapsed = time.time() - func_start
             current_app.logger.debug(f"[TIMING] get_active_subtitle_details: {elapsed:.3f}s (local by hash)")
@@ -542,7 +544,9 @@ async def _search_providers_by_hash(user, imdb_id, video_hash, content_type, lan
                 'ai_translated': result.ai_translated,
                 'forced': result.forced,
                 'moviehash_match': True,
-                'url': result.metadata.get('url', '') if result.metadata else ''
+                'url': result.metadata.get('url', '') if result.metadata else '',
+                'match_kind': 'hash',
+                'filename_score': None,
             }
         # If we have cached results but no hash match, don't do another search
         return None
@@ -605,7 +609,9 @@ async def _search_providers_by_hash(user, imdb_id, video_hash, content_type, lan
                 'ai_translated': result.ai_translated,
                 'forced': result.forced,
                 'moviehash_match': result.metadata.get('hash_match', False),
-                'url': result.metadata.get('url', '') if result.metadata else ''
+                'url': result.metadata.get('url', '') if result.metadata else '',
+                'match_kind': 'hash',
+                'filename_score': None,
             }
     except Exception as e:
         current_app.logger.warning(f"Error in provider hash search: {e}")
@@ -712,7 +718,9 @@ async def _find_best_match_by_filename(user, content_id, imdb_id, video_filename
         return {
             'type': 'local',
             'subtitle': best['subtitle'],
-            'user_vote_value': await _get_user_vote(user, best['subtitle'].id)
+            'user_vote_value': await _get_user_vote(user, best['subtitle'].id),
+            'match_kind': 'filename',
+            'filename_score': best['score'],
         }
     else:
         return {
@@ -729,7 +737,9 @@ async def _find_best_match_by_filename(user, content_id, imdb_id, video_filename
             'ai_translated': best.get('ai_translated'),
             'forced': best.get('forced', False),
             'moviehash_match': best.get('moviehash_match', False),
-            'url': best.get('url', '')
+            'url': best.get('url', ''),
+            'match_kind': 'filename',
+            'filename_score': best['score'],
         }
 
 
@@ -746,7 +756,9 @@ async def _find_fallback_subtitle(user, content_id, imdb_id, content_type, lang,
         return {
             'type': 'local',
             'subtitle': local_sub,
-            'user_vote_value': await _get_user_vote(user, local_sub.id)
+            'user_vote_value': await _get_user_vote(user, local_sub.id),
+            'match_kind': 'fallback',
+            'filename_score': None,
         }
     
     if not imdb_id and not cached_results:
@@ -845,7 +857,9 @@ async def _find_fallback_subtitle(user, content_id, imdb_id, content_type, lang,
                 'ai_translated': chosen.ai_translated,
                 'forced': chosen.forced,
                 'moviehash_match': chosen.metadata.get('hash_match', False) if chosen.metadata else False,
-                'url': chosen.metadata.get('url', '') if chosen.metadata else ''
+                'url': chosen.metadata.get('url', '') if chosen.metadata else '',
+                'match_kind': 'fallback',
+                'filename_score': None,
             }
             if not cached_results:
                 gc.collect()
@@ -1031,6 +1045,45 @@ async def process_subtitle_content(content: bytes, extension: str, encoding=None
         'original': None,
         'original_format': None
     }
+
+
+async def download_provider_subtitle_bytes(user, provider_name, subtitle_id, episode=None):
+    """Download a provider subtitle and return raw bytes plus file extension."""
+    from ..providers.registry import ProviderRegistry
+    from ..providers.base import ProviderDownloadError
+
+    provider = ProviderRegistry.get(provider_name)
+    if not provider or not await provider.is_authenticated(user):
+        raise ValueError(f"Provider {provider_name} is not available")
+
+    provider_subtitle_url = await provider.get_download_url(user, subtitle_id)
+    if provider_subtitle_url is None:
+        zip_content = await provider.download_subtitle(user, subtitle_id)
+        subtitle_content, _filename, extension = extract_subtitle_from_zip(zip_content, episode=episode)
+        return subtitle_content, extension
+
+    async with aiohttp.ClientSession() as session:
+        async with session.get(provider_subtitle_url, timeout=aiohttp.ClientTimeout(total=30)) as response:
+            response.raise_for_status()
+            body = await response.read()
+
+    content_type = response.headers.get('Content-Type', '')
+    url_path = provider_subtitle_url.split('?', 1)[0].lower()
+    is_zip_response = (
+        'zip' in content_type.lower()
+        or url_path.endswith('.zip')
+        or (len(body) >= 2 and body[:2] == b'PK')
+    )
+    if is_zip_response:
+        subtitle_content, _filename, extension = extract_subtitle_from_zip(body, episode=episode)
+        return subtitle_content, extension
+
+    extension = '.srt'
+    if url_path.endswith('.vtt'):
+        extension = '.vtt'
+    elif url_path.endswith('.ass') or url_path.endswith('.ssa'):
+        extension = '.ass'
+    return body, extension
 
 
 

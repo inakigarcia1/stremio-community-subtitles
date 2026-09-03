@@ -94,6 +94,13 @@ async def _handle_addon_stream(user, content_type: str, content_id: str, params:
         current_app.logger.info(f"Ignoring as those are probably from the Docchi extension with hardcoded subs")
         return respond_with({'subtitles': []})
 
+    has_embedded_spanish = parsed_params.get('hasEmbeddedSpanish', '').strip().lower() in {'1', 'true', 'yes'}
+    if has_embedded_spanish:
+        current_app.logger.info(
+            f"Skipping subtitle search for {content_type}/{content_id}: client reported embedded Spanish"
+        )
+        return respond_with_no_cache({'subtitles': []})
+
     video_size = None
     if video_size_str:
         try:
@@ -246,24 +253,42 @@ async def _handle_addon_stream(user, content_type: str, content_id: str, params:
                 active_providers = await ProviderRegistry.get_active_for_user(user)
                 
                 if active_providers:
+                    search_langs = list(preferred_langs)
+                    if 'spa' in search_langs and 'eng' not in search_langs:
+                        search_langs.append('eng')
                     search_params = {
                         'imdb_id': imdb_id,
                         'content_id': content_id,
                         'video_hash': video_hash,
                         'video_size': video_size,
-                        'languages': preferred_langs,
+                        'languages': search_langs,
                         'season': season,
                         'episode': episode,
                         'content_type': content_type,
                         'video_filename': video_filename
                     }
                     cached_provider_results = await search_providers_parallel(user, active_providers, search_params, timeout=10)
-                    current_app.logger.info(f"Pre-searched providers for {len(preferred_langs)} languages: {list(cached_provider_results.keys())}")
+                    current_app.logger.info(f"Pre-searched providers for {len(search_langs)} languages: {list(cached_provider_results.keys())}")
             except Exception as e:
                 current_app.logger.error(f"Error in provider pre-search: {e}", exc_info=True)
 
     # Parallel search for all languages
     async def process_language(preferred_lang):
+        english_reference = None
+        if preferred_lang == 'spa':
+            try:
+                english_reference = await get_active_subtitle_details(
+                    user,
+                    content_id,
+                    video_hash,
+                    content_type,
+                    video_filename,
+                    'eng',
+                    cached_provider_results=cached_provider_results,
+                )
+            except Exception as e:
+                current_app.logger.warning(f"English reference search failed for {content_id}: {e}")
+
         download_context = {
             'content_type': content_type,
             'content_id': content_id,
@@ -272,15 +297,20 @@ async def _handle_addon_stream(user, content_type: str, content_id: str, params:
             'v_size': video_size,
             'v_fname': video_filename
         }
-        try:
-            context_json = json.dumps(download_context, separators=(',', ':'))
-            download_identifier = base64.urlsafe_b64encode(context_json.encode('utf-8')).decode('utf-8').rstrip('=')
-        except Exception as e:
-            current_app.logger.error(f"Failed to encode download context: {e}")
-            return None
 
         try:
             active_subtitle_info = await get_active_subtitle_details(user, content_id, video_hash, content_type, video_filename, preferred_lang, cached_provider_results=cached_provider_results)
+
+            if preferred_lang == 'spa':
+                from ..lib.ffsubsync_service import build_sync_metadata
+                download_context['sync'] = build_sync_metadata(active_subtitle_info, english_reference)
+
+            try:
+                context_json = json.dumps(download_context, separators=(',', ':'))
+                download_identifier = base64.urlsafe_b64encode(context_json.encode('utf-8')).decode('utf-8').rstrip('=')
+            except Exception as e:
+                current_app.logger.error(f"Failed to encode download context: {e}")
+                return None
             
             # Check if we should add subtitle entry
             has_subtitles = active_subtitle_info['type'] != 'none'
@@ -720,6 +750,12 @@ async def _unified_download_for_user(user, download_identifier: str):
                 failed_provider_error = str(e)
 
     if vtt_content:
+        sync_meta = context.get('sync') if lang == 'spa' else None
+        if sync_meta:
+            from ..lib.ffsubsync_service import maybe_apply_ffsubsync
+            synced_vtt = await maybe_apply_ffsubsync(user, vtt_content, context, sync_meta, episode=episode)
+            if synced_vtt:
+                vtt_content = synced_vtt
         vtt_content = normalize_vtt_for_players(vtt_content)
         if not vtt_content.strip().upper().startswith("WEBVTT"):
             current_app.logger.warning("Content served is not VTT, serving as plain text")
