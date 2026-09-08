@@ -3,6 +3,7 @@ import datetime
 import json
 import base64
 import tempfile
+import time
 import uuid
 import asyncio
 import aiohttp
@@ -287,7 +288,18 @@ async def _handle_addon_stream(user, content_type: str, content_id: str, params:
                     cached_provider_results=cached_provider_results,
                 )
             except Exception as e:
-                current_app.logger.warning(f"English reference search failed for {content_id}: {e}")
+                current_app.logger.warning(f"[ffsubsync] English reference search failed for {content_id}: {e}")
+            elif english_reference and english_reference.get("type") != "none":
+                current_app.logger.info(
+                    f"[ffsubsync] English reference selected for {content_id}: "
+                    f"provider={english_reference.get('provider_name')} "
+                    f"id={english_reference.get('provider_subtitle_id')} "
+                    f"match_kind={english_reference.get('match_kind')} "
+                    f"filename_score={english_reference.get('filename_score')} "
+                    f"release_name={english_reference.get('release_name')}"
+                )
+            else:
+                current_app.logger.warning(f"[ffsubsync] No English reference found for {content_id}")
 
         download_context = {
             'content_type': content_type,
@@ -304,6 +316,17 @@ async def _handle_addon_stream(user, content_type: str, content_id: str, params:
             if preferred_lang == 'spa':
                 from ..lib.ffsubsync_service import build_sync_metadata
                 download_context['sync'] = build_sync_metadata(active_subtitle_info, english_reference)
+                current_app.logger.info(
+                    f"[ffsubsync] Spanish subtitle selected for {content_id}: "
+                    f"provider={active_subtitle_info.get('provider_name')} "
+                    f"id={active_subtitle_info.get('provider_subtitle_id')} "
+                    f"match_kind={active_subtitle_info.get('match_kind')} "
+                    f"filename_score={active_subtitle_info.get('filename_score')} "
+                    f"release_name={active_subtitle_info.get('release_name')}"
+                )
+                current_app.logger.info(
+                    f"[ffsubsync] Sync metadata for {content_id}: {download_context['sync']}"
+                )
 
             try:
                 context_json = json.dumps(download_context, separators=(',', ':'))
@@ -753,9 +776,26 @@ async def _unified_download_for_user(user, download_identifier: str):
         sync_meta = context.get('sync') if lang == 'spa' else None
         if sync_meta:
             from ..lib.ffsubsync_service import maybe_apply_ffsubsync
+            ffsubsync_start = time.perf_counter()
+            current_app.logger.info(
+                f"[ffsubsync] Download sync attempt for content_id={content_id} lang={lang} "
+                f"sync_meta={sync_meta} input_vtt_bytes={len(vtt_content.encode('utf-8'))}"
+            )
             synced_vtt = await maybe_apply_ffsubsync(user, vtt_content, context, sync_meta, episode=episode)
+            ffsubsync_elapsed = time.perf_counter() - ffsubsync_start
             if synced_vtt:
+                current_app.logger.info(
+                    f"[ffsubsync] Serving SYNCED subtitle for content_id={content_id} "
+                    f"elapsed={ffsubsync_elapsed:.3f}s "
+                    f"output_bytes={len(synced_vtt.encode('utf-8'))} "
+                    f"original_bytes={len(vtt_content.encode('utf-8'))}"
+                )
                 vtt_content = synced_vtt
+            else:
+                current_app.logger.info(
+                    f"[ffsubsync] Serving ORIGINAL (unsynced) subtitle for content_id={content_id} "
+                    f"elapsed={ffsubsync_elapsed:.3f}s bytes={len(vtt_content.encode('utf-8'))}"
+                )
         vtt_content = normalize_vtt_for_players(vtt_content)
         if not vtt_content.strip().upper().startswith("WEBVTT"):
             current_app.logger.warning("Content served is not VTT, serving as plain text")

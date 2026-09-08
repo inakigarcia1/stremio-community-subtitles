@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import os
 import subprocess
 import tempfile
@@ -9,6 +10,9 @@ import time
 from typing import Any, Dict, Optional, Tuple
 
 from pysubs2 import SSAFile, load
+
+logger = logging.getLogger(__name__)
+LOG_PREFIX = "[ffsubsync]"
 
 DEFAULT_MIN_FILENAME_SCORE = 0.5
 DEFAULT_TIMEOUT_SECONDS = 15
@@ -48,21 +52,25 @@ def sync_cache_dir() -> str:
     return base
 
 
-def should_ffsubsync(sync_meta: Optional[Dict[str, Any]]) -> bool:
+def ffsubsync_skip_reason(sync_meta: Optional[Dict[str, Any]]) -> Optional[str]:
+    """Return human-readable skip reason, or None if ffsubsync should run."""
     if not sync_meta:
-        return False
+        return "no sync metadata"
     match_kind = sync_meta.get("match_kind")
     if match_kind in {"hash", "local_hash"}:
-        return False
+        return f"match_kind={match_kind} (already hash-aligned)"
     score = sync_meta.get("filename_score")
     if match_kind == "filename" and score is not None and score >= min_filename_score():
-        return False
-    return bool(
-        sync_meta.get("eng_provider")
-        and sync_meta.get("eng_id")
-        and sync_meta.get("spa_provider")
-        and sync_meta.get("spa_id")
-    )
+        return f"filename_score={score:.4f} >= threshold={min_filename_score()}"
+    if not sync_meta.get("eng_provider") or not sync_meta.get("eng_id"):
+        return "missing English reference (eng_provider/eng_id)"
+    if not sync_meta.get("spa_provider") or not sync_meta.get("spa_id"):
+        return "missing Spanish subtitle (spa_provider/spa_id)"
+    return None
+
+
+def should_ffsubsync(sync_meta: Optional[Dict[str, Any]]) -> bool:
+    return ffsubsync_skip_reason(sync_meta) is None
 
 
 def make_sync_cache_key(context: Dict[str, Any], sync_meta: Dict[str, Any]) -> str:
@@ -95,6 +103,13 @@ def read_cached_vtt(cache_key: str) -> Optional[str]:
             os.remove(path)
         except OSError:
             pass
+        logger.info(
+            "%s Cache entry expired (age=%.0fs ttl=%ds) cache_key=%s",
+            LOG_PREFIX,
+            age,
+            sync_cache_ttl_seconds(),
+            cache_key,
+        )
         return None
     with open(path, "r", encoding="utf-8") as handle:
         return handle.read()
@@ -134,6 +149,13 @@ def run_ffsubsync(reference_srt: str, input_srt: str, output_srt: str) -> bool:
         "-o",
         output_srt,
     ]
+    start = time.perf_counter()
+    logger.info(
+        "%s Starting CLI: %s (timeout=%ds)",
+        LOG_PREFIX,
+        " ".join(cmd),
+        ffsubsync_timeout_seconds(),
+    )
     try:
         completed = subprocess.run(
             cmd,
@@ -142,8 +164,40 @@ def run_ffsubsync(reference_srt: str, input_srt: str, output_srt: str) -> bool:
             timeout=ffsubsync_timeout_seconds(),
             check=False,
         )
-        return completed.returncode == 0 and os.path.exists(output_srt)
-    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        elapsed = time.perf_counter() - start
+        if completed.returncode == 0 and os.path.exists(output_srt):
+            output_size = os.path.getsize(output_srt)
+            logger.info(
+                "%s CLI finished successfully in %.3fs (output_size=%d bytes)",
+                LOG_PREFIX,
+                elapsed,
+                output_size,
+            )
+            return True
+        logger.warning(
+            "%s CLI failed in %.3fs returncode=%s output_exists=%s stderr=%r stdout=%r",
+            LOG_PREFIX,
+            elapsed,
+            completed.returncode,
+            os.path.exists(output_srt),
+            (completed.stderr or "").strip()[:500],
+            (completed.stdout or "").strip()[:500],
+        )
+        return False
+    except subprocess.TimeoutExpired:
+        elapsed = time.perf_counter() - start
+        logger.warning(
+            "%s CLI timed out after %.3fs (limit=%ds)",
+            LOG_PREFIX,
+            elapsed,
+            ffsubsync_timeout_seconds(),
+        )
+        return False
+    except FileNotFoundError:
+        logger.error("%s ffsubsync binary not found in PATH", LOG_PREFIX)
+        return False
+    except OSError as exc:
+        logger.error("%s CLI OS error: %s", LOG_PREFIX, exc)
         return False
 
 
@@ -153,6 +207,17 @@ def srt_to_vtt(srt_content: str) -> str:
 
 
 def sync_spanish_with_english_reference(reference_srt: str, spanish_srt: str) -> Optional[str]:
+    ref_lines = reference_srt.count("\n") + 1 if reference_srt else 0
+    spa_lines = spanish_srt.count("\n") + 1 if spanish_srt else 0
+    start = time.perf_counter()
+    logger.info(
+        "%s sync_spanish_with_english_reference started (ref_srt_lines=%d spa_srt_lines=%d ref_bytes=%d spa_bytes=%d)",
+        LOG_PREFIX,
+        ref_lines,
+        spa_lines,
+        len(reference_srt.encode("utf-8")),
+        len(spanish_srt.encode("utf-8")),
+    )
     with tempfile.TemporaryDirectory(prefix="ffsubsync-") as workdir:
         reference_path = os.path.join(workdir, "reference.srt")
         input_path = os.path.join(workdir, "input.srt")
@@ -162,10 +227,20 @@ def sync_spanish_with_english_reference(reference_srt: str, spanish_srt: str) ->
         with open(input_path, "w", encoding="utf-8") as handle:
             handle.write(spanish_srt)
         if not run_ffsubsync(reference_path, input_path, output_path):
+            elapsed = time.perf_counter() - start
+            logger.warning("%s sync_spanish_with_english_reference failed in %.3fs", LOG_PREFIX, elapsed)
             return None
         with open(output_path, "r", encoding="utf-8") as handle:
             synced_srt = handle.read()
-        return srt_to_vtt(synced_srt)
+        synced_vtt = srt_to_vtt(synced_srt)
+        elapsed = time.perf_counter() - start
+        logger.info(
+            "%s sync_spanish_with_english_reference finished in %.3fs (output_vtt_bytes=%d)",
+            LOG_PREFIX,
+            elapsed,
+            len(synced_vtt.encode("utf-8")),
+        )
+        return synced_vtt
 
 
 def build_sync_metadata(active_info: Dict[str, Any], english_info: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -184,30 +259,144 @@ def build_sync_metadata(active_info: Dict[str, Any], english_info: Optional[Dict
 async def maybe_apply_ffsubsync(user, vtt_content: str, context: Dict[str, Any], sync_meta: Dict[str, Any], episode=None) -> Optional[str]:
     from ..lib.subtitles import normalize_vtt_for_players
 
-    if not should_ffsubsync(sync_meta):
+    content_id = context.get("content_id", "?")
+    skip_reason = ffsubsync_skip_reason(sync_meta)
+    if skip_reason:
+        logger.info(
+            "%s Skipped content_id=%s reason=%s match_kind=%s filename_score=%s "
+            "spa=%s/%s eng=%s/%s",
+            LOG_PREFIX,
+            content_id,
+            skip_reason,
+            sync_meta.get("match_kind"),
+            sync_meta.get("filename_score"),
+            sync_meta.get("spa_provider"),
+            sync_meta.get("spa_id"),
+            sync_meta.get("eng_provider"),
+            sync_meta.get("eng_id"),
+        )
         return None
+
+    total_start = time.perf_counter()
+    logger.info(
+        "%s Triggered content_id=%s match_kind=%s filename_score=%s "
+        "spa_ref=%s/%s eng_ref=%s/%s input_vtt_bytes=%d",
+        LOG_PREFIX,
+        content_id,
+        sync_meta.get("match_kind"),
+        sync_meta.get("filename_score"),
+        sync_meta.get("spa_provider"),
+        sync_meta.get("spa_id"),
+        sync_meta.get("eng_provider"),
+        sync_meta.get("eng_id"),
+        len(vtt_content.encode("utf-8")),
+    )
 
     cache_key = make_sync_cache_key(context, sync_meta)
     cached = read_cached_vtt(cache_key)
     if cached:
+        total_elapsed = time.perf_counter() - total_start
+        logger.info(
+            "%s Cache HIT content_id=%s cache_key=%s cached_bytes=%d lookup_time=%.3fs",
+            LOG_PREFIX,
+            content_id,
+            cache_key,
+            len(cached.encode("utf-8")),
+            total_elapsed,
+        )
         return cached
+
+    logger.info("%s Cache MISS content_id=%s cache_key=%s", LOG_PREFIX, content_id, cache_key)
 
     from ..routes.utils import download_provider_subtitle_bytes
 
     eng_provider = sync_meta.get("eng_provider")
     eng_id = sync_meta.get("eng_id")
     if not eng_provider or not eng_id:
+        logger.warning(
+            "%s Aborted content_id=%s: eng_provider/eng_id missing after gate check",
+            LOG_PREFIX,
+            content_id,
+        )
         return None
 
     try:
+        download_start = time.perf_counter()
         eng_bytes, eng_ext = await download_provider_subtitle_bytes(user, eng_provider, eng_id, episode=episode)
+        download_elapsed = time.perf_counter() - download_start
+        logger.info(
+            "%s English reference downloaded in %.3fs content_id=%s provider=%s id=%s ext=%s bytes=%d",
+            LOG_PREFIX,
+            download_elapsed,
+            content_id,
+            eng_provider,
+            eng_id,
+            eng_ext,
+            len(eng_bytes),
+        )
+
+        convert_start = time.perf_counter()
         reference_srt = subtitle_bytes_to_srt(eng_bytes, eng_ext)
         spanish_srt = SSAFile.from_string(vtt_content).to_string("srt")
+        convert_elapsed = time.perf_counter() - convert_start
+        logger.info(
+            "%s Converted to SRT in %.3fs content_id=%s ref_srt_bytes=%d spa_srt_bytes=%d",
+            LOG_PREFIX,
+            convert_elapsed,
+            content_id,
+            len(reference_srt.encode("utf-8")),
+            len(spanish_srt.encode("utf-8")),
+        )
+
+        sync_start = time.perf_counter()
         synced_vtt = sync_spanish_with_english_reference(reference_srt, spanish_srt)
+        sync_elapsed = time.perf_counter() - sync_start
+
         if not synced_vtt:
+            total_elapsed = time.perf_counter() - total_start
+            logger.warning(
+                "%s Sync FAILED content_id=%s total_time=%.3fs "
+                "(eng_download=%.3fs convert=%.3fs sync=%.3fs) eng_ref=%s/%s",
+                LOG_PREFIX,
+                content_id,
+                total_elapsed,
+                download_elapsed,
+                convert_elapsed,
+                sync_elapsed,
+                eng_provider,
+                eng_id,
+            )
             return None
+
         synced_vtt = normalize_vtt_for_players(synced_vtt)
         write_cached_vtt(cache_key, synced_vtt)
+        total_elapsed = time.perf_counter() - total_start
+        logger.info(
+            "%s Sync SUCCEEDED content_id=%s sync_time=%.3fs total_time=%.3fs "
+            "input_vtt_bytes=%d output_vtt_bytes=%d eng_ref=%s/%s spa=%s/%s cache_key=%s",
+            LOG_PREFIX,
+            content_id,
+            sync_elapsed,
+            total_elapsed,
+            len(vtt_content.encode("utf-8")),
+            len(synced_vtt.encode("utf-8")),
+            eng_provider,
+            eng_id,
+            sync_meta.get("spa_provider"),
+            sync_meta.get("spa_id"),
+            cache_key,
+        )
         return synced_vtt
     except Exception:
+        total_elapsed = time.perf_counter() - total_start
+        logger.exception(
+            "%s Sync ERROR content_id=%s after %.3fs eng_ref=%s/%s spa=%s/%s",
+            LOG_PREFIX,
+            content_id,
+            total_elapsed,
+            eng_provider,
+            eng_id,
+            sync_meta.get("spa_provider"),
+            sync_meta.get("spa_id"),
+        )
         return None
