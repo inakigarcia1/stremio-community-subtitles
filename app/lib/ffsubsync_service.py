@@ -14,6 +14,24 @@ from pysubs2 import SSAFile, load
 logger = logging.getLogger(__name__)
 LOG_PREFIX = "[ffsubsync]"
 
+
+def ffsubsync_logger():
+    """Dedicated logger; always INFO on stdout (see app.create_app)."""
+    return logger
+
+
+def describe_eng_reference_source(sync_meta: Optional[Dict[str, Any]]) -> str:
+    """Human-readable label for which English reference ffsubsync would use."""
+    if not sync_meta:
+        return "none (no sync metadata)"
+    eng_provider = sync_meta.get("eng_provider")
+    eng_id = sync_meta.get("eng_id")
+    if not eng_provider or not eng_id:
+        return "none (missing eng_provider/eng_id)"
+    if eng_provider == EMBEDDED_PROVIDER:
+        return f"client embedded upload (hash={eng_id})"
+    return f"community provider {eng_provider} (id={eng_id})"
+
 DEFAULT_MIN_FILENAME_SCORE = 0.5
 DEFAULT_TIMEOUT_SECONDS = 15
 DEFAULT_CACHE_TTL_SECONDS = 21600
@@ -72,7 +90,7 @@ def reference_extension(filename: Optional[str]) -> str:
 
 def save_embedded_reference(data: bytes, filename: Optional[str] = None) -> Optional[Dict[str, Any]]:
     if not data or len(data) > MAX_EMBEDDED_REFERENCE_BYTES:
-        logger.warning(
+        ffsubsync_logger().warning(
             "%s Rejected embedded reference (bytes=%d max=%d)",
             LOG_PREFIX,
             0 if not data else len(data),
@@ -85,12 +103,13 @@ def save_embedded_reference(data: bytes, filename: Optional[str] = None) -> Opti
     if not os.path.exists(path):
         with open(path, "wb") as handle:
             handle.write(data)
-    logger.info(
-        "%s Stored embedded reference hash=%s ext=%s bytes=%d",
+    ffsubsync_logger().info(
+        "%s Stored embedded reference hash=%s ext=%s bytes=%d filename=%s",
         LOG_PREFIX,
         digest,
         ext,
         len(data),
+        filename or "(unknown)",
     )
     return {
         "type": EMBEDDED_PROVIDER,
@@ -356,34 +375,33 @@ async def maybe_apply_ffsubsync(user, vtt_content: str, context: Dict[str, Any],
             content_id,
         )
     skip_reason = ffsubsync_skip_reason(sync_meta)
+    eng_source = describe_eng_reference_source(sync_meta)
     if skip_reason:
-        logger.info(
-            "%s Skipped content_id=%s reason=%s match_kind=%s filename_score=%s "
-            "spa=%s/%s eng=%s/%s",
+        ffsubsync_logger().info(
+            "%s Skipped sync content_id=%s reason=%s eng_source=%s match_kind=%s filename_score=%s "
+            "spa=%s/%s",
             LOG_PREFIX,
             content_id,
             skip_reason,
+            eng_source,
             sync_meta.get("match_kind"),
             sync_meta.get("filename_score"),
             sync_meta.get("spa_provider"),
             sync_meta.get("spa_id"),
-            sync_meta.get("eng_provider"),
-            sync_meta.get("eng_id"),
         )
         return None
 
     total_start = time.perf_counter()
-    logger.info(
-        "%s Triggered content_id=%s match_kind=%s filename_score=%s "
-        "spa_ref=%s/%s eng_ref=%s/%s input_vtt_bytes=%d",
+    ffsubsync_logger().info(
+        "%s Running sync content_id=%s eng_source=%s match_kind=%s filename_score=%s "
+        "spa=%s/%s input_vtt_bytes=%d",
         LOG_PREFIX,
         content_id,
+        eng_source,
         sync_meta.get("match_kind"),
         sync_meta.get("filename_score"),
         sync_meta.get("spa_provider"),
         sync_meta.get("spa_id"),
-        sync_meta.get("eng_provider"),
-        sync_meta.get("eng_id"),
         len(vtt_content.encode("utf-8")),
     )
 
@@ -416,10 +434,16 @@ async def maybe_apply_ffsubsync(user, vtt_content: str, context: Dict[str, Any],
     try:
         download_start = time.perf_counter()
         if eng_provider == EMBEDDED_PROVIDER:
+            ffsubsync_logger().info(
+                "%s Loading English reference from CLIENT EMBEDDED upload content_id=%s hash=%s",
+                LOG_PREFIX,
+                content_id,
+                eng_id,
+            )
             embedded = read_embedded_reference_bytes(str(eng_id))
             if embedded is None:
-                logger.warning(
-                    "%s Aborted content_id=%s: embedded reference missing hash=%s",
+                ffsubsync_logger().warning(
+                    "%s Aborted content_id=%s: embedded reference file missing or expired hash=%s",
                     LOG_PREFIX,
                     content_id,
                     eng_id,
@@ -427,15 +451,23 @@ async def maybe_apply_ffsubsync(user, vtt_content: str, context: Dict[str, Any],
                 return None
             eng_bytes, eng_ext = embedded
         else:
+            ffsubsync_logger().info(
+                "%s Loading English reference from COMMUNITY provider content_id=%s provider=%s id=%s",
+                LOG_PREFIX,
+                content_id,
+                eng_provider,
+                eng_id,
+            )
             from ..routes.utils import download_provider_subtitle_bytes
             eng_bytes, eng_ext = await download_provider_subtitle_bytes(user, eng_provider, eng_id, episode=episode)
         download_elapsed = time.perf_counter() - download_start
-        logger.info(
-            "%s English reference loaded in %.3fs content_id=%s provider=%s id=%s ext=%s bytes=%d",
+        ref_source = "client embedded" if eng_provider == EMBEDDED_PROVIDER else f"community/{eng_provider}"
+        ffsubsync_logger().info(
+            "%s English reference loaded in %.3fs content_id=%s source=%s id=%s ext=%s bytes=%d",
             LOG_PREFIX,
             download_elapsed,
             content_id,
-            eng_provider,
+            ref_source,
             eng_id,
             eng_ext,
             len(eng_bytes),
@@ -477,17 +509,16 @@ async def maybe_apply_ffsubsync(user, vtt_content: str, context: Dict[str, Any],
         synced_vtt = normalize_vtt_for_players(synced_vtt)
         write_cached_vtt(cache_key, synced_vtt)
         total_elapsed = time.perf_counter() - total_start
-        logger.info(
-            "%s Sync SUCCEEDED content_id=%s sync_time=%.3fs total_time=%.3fs "
-            "input_vtt_bytes=%d output_vtt_bytes=%d eng_ref=%s/%s spa=%s/%s cache_key=%s",
+        ffsubsync_logger().info(
+            "%s Sync SUCCEEDED content_id=%s eng_source=%s sync_time=%.3fs total_time=%.3fs "
+            "input_vtt_bytes=%d output_vtt_bytes=%d spa=%s/%s cache_key=%s",
             LOG_PREFIX,
             content_id,
+            "client embedded" if eng_provider == EMBEDDED_PROVIDER else f"community/{eng_provider}",
             sync_elapsed,
             total_elapsed,
             len(vtt_content.encode("utf-8")),
             len(synced_vtt.encode("utf-8")),
-            eng_provider,
-            eng_id,
             sync_meta.get("spa_provider"),
             sync_meta.get("spa_id"),
             cache_key,

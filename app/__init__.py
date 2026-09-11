@@ -35,6 +35,16 @@ def create_app():
     logging.basicConfig(level=logging.DEBUG if app.config['DEBUG'] else logging.WARNING)
     app.logger.setLevel(logging.DEBUG if app.config['DEBUG'] else logging.WARNING)
 
+    # ffsubsync decision logs are always useful in container stdout.
+    ffsubsync_logger = logging.getLogger('app.lib.ffsubsync_service')
+    ffsubsync_logger.setLevel(logging.INFO)
+    if not ffsubsync_logger.handlers:
+        ffsubsync_handler = logging.StreamHandler()
+        ffsubsync_handler.setLevel(logging.INFO)
+        ffsubsync_handler.setFormatter(logging.Formatter('%(message)s'))
+        ffsubsync_logger.addHandler(ffsubsync_handler)
+        ffsubsync_logger.propagate = False
+
     # Better Stack
     if app.config.get('USE_BETTERSTACK') and app.config.get('BETTERSTACK_SOURCE_TOKEN'):
         try:
