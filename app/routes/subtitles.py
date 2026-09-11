@@ -40,9 +40,41 @@ import aiofiles
 
 subtitles_bp = Blueprint('subtitles', __name__)
 
+EMBEDDED_REFERENCE_FORM_FIELD = 'reference'
 
-@subtitles_bp.route('/subtitles/<content_type>/<content_id>.json')
-@subtitles_bp.route('/subtitles/<content_type>/<content_id>/<path:params>')
+
+async def _load_embedded_reference_from_request():
+    if request.method != 'POST':
+        return None
+    try:
+        files = await request.files
+    except Exception as exc:
+        current_app.logger.warning(f"[ffsubsync] Failed to parse multipart files: {exc}")
+        return None
+    upload = files.get(EMBEDDED_REFERENCE_FORM_FIELD) if files else None
+    if upload is None:
+        return None
+    try:
+        data = upload.read()
+    except Exception as exc:
+        current_app.logger.warning(f"[ffsubsync] Failed to read embedded reference upload: {exc}")
+        return None
+    from ..lib.ffsubsync_service import save_embedded_reference
+    saved = save_embedded_reference(data, getattr(upload, 'filename', None))
+    if not saved:
+        return None
+    try:
+        form = await request.form
+        lang = (form.get('referenceLang') or '').strip()
+        if lang:
+            saved['lang'] = lang
+    except Exception:
+        pass
+    return saved
+
+
+@subtitles_bp.route('/subtitles/<content_type>/<content_id>.json', methods=['GET', 'POST'])
+@subtitles_bp.route('/subtitles/<content_type>/<content_id>/<path:params>', methods=['GET', 'POST'])
 async def service_addon_stream(content_type: str, content_id: str, params: str = None):
     """Tokenless subtitle search for the internal Apachiy service user."""
     user = await get_service_user()
@@ -94,6 +126,8 @@ async def _handle_addon_stream(user, content_type: str, content_id: str, params:
     if video_filename and video_filename.endswith(".docc"):
         current_app.logger.info(f"Ignoring as those are probably from the Docchi extension with hardcoded subs")
         return respond_with({'subtitles': []})
+
+    embedded_reference = await _load_embedded_reference_from_request()
 
     has_embedded_spanish = parsed_params.get('hasEmbeddedSpanish', '').strip().lower() in {'1', 'true', 'yes'}
     if has_embedded_spanish:
@@ -255,7 +289,7 @@ async def _handle_addon_stream(user, content_type: str, content_id: str, params:
                 
                 if active_providers:
                     search_langs = list(preferred_langs)
-                    if 'spa' in search_langs and 'eng' not in search_langs:
+                    if 'spa' in search_langs and 'eng' not in search_langs and not embedded_reference:
                         search_langs.append('eng')
                     search_params = {
                         'imdb_id': imdb_id,
@@ -276,7 +310,14 @@ async def _handle_addon_stream(user, content_type: str, content_id: str, params:
     # Parallel search for all languages
     async def process_language(preferred_lang):
         english_reference = None
-        if preferred_lang == 'spa':
+        if preferred_lang == 'spa' and embedded_reference:
+            english_reference = embedded_reference
+            current_app.logger.info(
+                f"[ffsubsync] Using embedded reference for {content_id}: "
+                f"id={embedded_reference.get('provider_subtitle_id')} "
+                f"ext={embedded_reference.get('ext')}"
+            )
+        elif preferred_lang == 'spa':
             try:
                 english_reference = await get_active_subtitle_details(
                     user,
@@ -289,17 +330,18 @@ async def _handle_addon_stream(user, content_type: str, content_id: str, params:
                 )
             except Exception as e:
                 current_app.logger.warning(f"[ffsubsync] English reference search failed for {content_id}: {e}")
-            elif english_reference and english_reference.get("type") != "none":
-                current_app.logger.info(
-                    f"[ffsubsync] English reference selected for {content_id}: "
-                    f"provider={english_reference.get('provider_name')} "
-                    f"id={english_reference.get('provider_subtitle_id')} "
-                    f"match_kind={english_reference.get('match_kind')} "
-                    f"filename_score={english_reference.get('filename_score')} "
-                    f"release_name={english_reference.get('release_name')}"
-                )
             else:
-                current_app.logger.warning(f"[ffsubsync] No English reference found for {content_id}")
+                if english_reference and english_reference.get("type") != "none":
+                    current_app.logger.info(
+                        f"[ffsubsync] English reference selected for {content_id}: "
+                        f"provider={english_reference.get('provider_name')} "
+                        f"id={english_reference.get('provider_subtitle_id')} "
+                        f"match_kind={english_reference.get('match_kind')} "
+                        f"filename_score={english_reference.get('filename_score')} "
+                        f"release_name={english_reference.get('release_name')}"
+                    )
+                else:
+                    current_app.logger.warning(f"[ffsubsync] No English reference found for {content_id}")
 
         download_context = {
             'content_type': content_type,

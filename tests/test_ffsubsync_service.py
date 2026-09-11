@@ -90,6 +90,71 @@ def test_build_sync_metadata_includes_english_reference():
     assert metadata["eng_id"] == "eng-1"
 
 
+def test_save_and_read_embedded_reference(tmp_path, monkeypatch):
+    monkeypatch.setenv("FFSUBSYNC_EMBEDDED_DIR", str(tmp_path))
+    monkeypatch.setenv("FFSUBSYNC_CACHE_TTL_SECONDS", "3600")
+    save_embedded_reference = ffsubsync_service.save_embedded_reference
+    read_embedded_reference_bytes = ffsubsync_service.read_embedded_reference_bytes
+
+    saved = save_embedded_reference(REFERENCE_SRT.encode("utf-8"), "ref.srt")
+    assert saved is not None
+    assert saved["provider_name"] == "embedded"
+    loaded = read_embedded_reference_bytes(saved["provider_subtitle_id"])
+    assert loaded is not None
+    data, ext = loaded
+    assert ext == ".srt"
+    assert b"Hello world" in data
+
+
+def test_save_embedded_reference_rejects_oversized(tmp_path, monkeypatch):
+    monkeypatch.setenv("FFSUBSYNC_EMBEDDED_DIR", str(tmp_path))
+    huge = b"x" * (ffsubsync_service.MAX_EMBEDDED_REFERENCE_BYTES + 1)
+    assert ffsubsync_service.save_embedded_reference(huge, "ref.srt") is None
+
+
+def test_make_sync_cache_key_includes_embedded_id():
+    context = {"content_id": "tt1", "v_hash": "h", "v_size": 1, "v_fname": "a.mkv"}
+    provider_meta = {
+        "spa_provider": "opensubtitles",
+        "spa_id": "spa",
+        "eng_provider": "opensubtitles",
+        "eng_id": "eng",
+    }
+    embedded_meta = {
+        "spa_provider": "opensubtitles",
+        "spa_id": "spa",
+        "eng_provider": "embedded",
+        "eng_id": "a" * 64,
+    }
+    assert make_sync_cache_key(context, provider_meta) != make_sync_cache_key(context, embedded_meta)
+
+
+def test_should_ffsubsync_runs_for_embedded_low_score():
+    assert should_ffsubsync(
+        {
+            "match_kind": "filename",
+            "filename_score": 0.2,
+            "eng_provider": "embedded",
+            "eng_id": "a" * 64,
+            "spa_provider": "opensubtitles",
+            "spa_id": "2",
+        }
+    )
+
+
+def test_should_ffsubsync_skips_embedded_when_filename_score_high():
+    assert not should_ffsubsync(
+        {
+            "match_kind": "filename",
+            "filename_score": 0.8,
+            "eng_provider": "embedded",
+            "eng_id": "a" * 64,
+            "spa_provider": "opensubtitles",
+            "spa_id": "2",
+        }
+    )
+
+
 @pytest.mark.skipif(
     os.system("ffsubsync --version >nul 2>&1") != 0,
     reason="ffsubsync CLI not installed in test environment",

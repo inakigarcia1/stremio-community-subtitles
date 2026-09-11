@@ -17,6 +17,9 @@ LOG_PREFIX = "[ffsubsync]"
 DEFAULT_MIN_FILENAME_SCORE = 0.5
 DEFAULT_TIMEOUT_SECONDS = 15
 DEFAULT_CACHE_TTL_SECONDS = 21600
+EMBEDDED_PROVIDER = "embedded"
+MAX_EMBEDDED_REFERENCE_BYTES = 5 * 1024 * 1024
+ALLOWED_REFERENCE_EXTENSIONS = {".srt", ".vtt", ".ass", ".ssa"}
 
 
 def min_filename_score() -> float:
@@ -52,20 +55,106 @@ def sync_cache_dir() -> str:
     return base
 
 
+def embedded_reference_dir() -> str:
+    base = os.environ.get("FFSUBSYNC_EMBEDDED_DIR", "/app/subtitles/embedded")
+    os.makedirs(base, exist_ok=True)
+    return base
+
+
+def reference_extension(filename: Optional[str]) -> str:
+    if not filename:
+        return ".srt"
+    ext = os.path.splitext(filename)[1].lower()
+    if ext in ALLOWED_REFERENCE_EXTENSIONS:
+        return ext
+    return ".srt"
+
+
+def save_embedded_reference(data: bytes, filename: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    if not data or len(data) > MAX_EMBEDDED_REFERENCE_BYTES:
+        logger.warning(
+            "%s Rejected embedded reference (bytes=%d max=%d)",
+            LOG_PREFIX,
+            0 if not data else len(data),
+            MAX_EMBEDDED_REFERENCE_BYTES,
+        )
+        return None
+    digest = hashlib.sha256(data).hexdigest()
+    ext = reference_extension(filename)
+    path = os.path.join(embedded_reference_dir(), f"{digest}{ext}")
+    if not os.path.exists(path):
+        with open(path, "wb") as handle:
+            handle.write(data)
+    logger.info(
+        "%s Stored embedded reference hash=%s ext=%s bytes=%d",
+        LOG_PREFIX,
+        digest,
+        ext,
+        len(data),
+    )
+    return {
+        "type": EMBEDDED_PROVIDER,
+        "provider_name": EMBEDDED_PROVIDER,
+        "provider_subtitle_id": digest,
+        "ext": ext,
+    }
+
+
+def _is_sha256_hex(value: str) -> bool:
+    if len(value) != 64:
+        return False
+    return all(char in "0123456789abcdef" for char in value.lower())
+
+
+def read_embedded_reference_bytes(file_hash: str) -> Optional[Tuple[bytes, str]]:
+    if not file_hash or not _is_sha256_hex(file_hash):
+        return None
+    digest = file_hash.lower()
+    ttl = sync_cache_ttl_seconds()
+    for ext in ALLOWED_REFERENCE_EXTENSIONS:
+        path = os.path.join(embedded_reference_dir(), f"{digest}{ext}")
+        if not os.path.isfile(path):
+            continue
+        age = time.time() - os.path.getmtime(path)
+        if age > ttl:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+            logger.info(
+                "%s Embedded reference expired (age=%.0fs ttl=%ds) hash=%s",
+                LOG_PREFIX,
+                age,
+                ttl,
+                digest,
+            )
+            continue
+        with open(path, "rb") as handle:
+            return handle.read(), ext
+    return None
+
+
+def ffsubsync_force_always() -> bool:
+    """When true, run ffsubsync whenever ENG+SPA refs exist (local testing only)."""
+    return os.environ.get("FFSUBSYNC_FORCE_ALWAYS", "").strip().lower() in {"1", "true", "yes"}
+
+
 def ffsubsync_skip_reason(sync_meta: Optional[Dict[str, Any]]) -> Optional[str]:
     """Return human-readable skip reason, or None if ffsubsync should run."""
     if not sync_meta:
         return "no sync metadata"
+    if not sync_meta.get("eng_provider") or not sync_meta.get("eng_id"):
+        return "missing English reference (eng_provider/eng_id)"
+    if not sync_meta.get("spa_provider") or not sync_meta.get("spa_id"):
+        return "missing Spanish subtitle (spa_provider/spa_id)"
+    if ffsubsync_force_always():
+        return None
     match_kind = sync_meta.get("match_kind")
     if match_kind in {"hash", "local_hash"}:
         return f"match_kind={match_kind} (already hash-aligned)"
     score = sync_meta.get("filename_score")
     if match_kind == "filename" and score is not None and score >= min_filename_score():
         return f"filename_score={score:.4f} >= threshold={min_filename_score()}"
-    if not sync_meta.get("eng_provider") or not sync_meta.get("eng_id"):
-        return "missing English reference (eng_provider/eng_id)"
-    if not sync_meta.get("spa_provider") or not sync_meta.get("spa_id"):
-        return "missing Spanish subtitle (spa_provider/spa_id)"
     return None
 
 
@@ -260,6 +349,12 @@ async def maybe_apply_ffsubsync(user, vtt_content: str, context: Dict[str, Any],
     from ..lib.subtitles import normalize_vtt_for_players
 
     content_id = context.get("content_id", "?")
+    if ffsubsync_force_always():
+        logger.warning(
+            "%s FFSUBSYNC_FORCE_ALWAYS enabled — skipping score/hash gates for content_id=%s",
+            LOG_PREFIX,
+            content_id,
+        )
     skip_reason = ffsubsync_skip_reason(sync_meta)
     if skip_reason:
         logger.info(
@@ -308,8 +403,6 @@ async def maybe_apply_ffsubsync(user, vtt_content: str, context: Dict[str, Any],
 
     logger.info("%s Cache MISS content_id=%s cache_key=%s", LOG_PREFIX, content_id, cache_key)
 
-    from ..routes.utils import download_provider_subtitle_bytes
-
     eng_provider = sync_meta.get("eng_provider")
     eng_id = sync_meta.get("eng_id")
     if not eng_provider or not eng_id:
@@ -322,10 +415,23 @@ async def maybe_apply_ffsubsync(user, vtt_content: str, context: Dict[str, Any],
 
     try:
         download_start = time.perf_counter()
-        eng_bytes, eng_ext = await download_provider_subtitle_bytes(user, eng_provider, eng_id, episode=episode)
+        if eng_provider == EMBEDDED_PROVIDER:
+            embedded = read_embedded_reference_bytes(str(eng_id))
+            if embedded is None:
+                logger.warning(
+                    "%s Aborted content_id=%s: embedded reference missing hash=%s",
+                    LOG_PREFIX,
+                    content_id,
+                    eng_id,
+                )
+                return None
+            eng_bytes, eng_ext = embedded
+        else:
+            from ..routes.utils import download_provider_subtitle_bytes
+            eng_bytes, eng_ext = await download_provider_subtitle_bytes(user, eng_provider, eng_id, episode=episode)
         download_elapsed = time.perf_counter() - download_start
         logger.info(
-            "%s English reference downloaded in %.3fs content_id=%s provider=%s id=%s ext=%s bytes=%d",
+            "%s English reference loaded in %.3fs content_id=%s provider=%s id=%s ext=%s bytes=%d",
             LOG_PREFIX,
             download_elapsed,
             content_id,
