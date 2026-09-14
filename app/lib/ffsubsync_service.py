@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+import re
 import subprocess
 import tempfile
 import time
@@ -33,11 +34,19 @@ def describe_eng_reference_source(sync_meta: Optional[Dict[str, Any]]) -> str:
     return f"community provider {eng_provider} (id={eng_id})"
 
 DEFAULT_MIN_FILENAME_SCORE = 0.5
-DEFAULT_TIMEOUT_SECONDS = 15
+DEFAULT_TIMEOUT_SECONDS = 20
 DEFAULT_CACHE_TTL_SECONDS = 21600
 EMBEDDED_PROVIDER = "embedded"
 MAX_EMBEDDED_REFERENCE_BYTES = 5 * 1024 * 1024
 ALLOWED_REFERENCE_EXTENSIONS = {".srt", ".vtt", ".ass", ".ssa"}
+# Reject the CLI result only when ffsubsync itself reports a weak match.
+# A non-1.0 scale is how PAL/NTSC (and similar) remuxes get fixed; ep8 was
+# score=27938 / scale=1.001. Garbage alignments show up as low/negative scores
+# (ep9=5327, ep15=-5816), not as "scale != 1".
+MIN_ALIGNMENT_SCORE = 12000.0
+MIN_REFERENCE_EVENTS = 24
+MIN_REFERENCE_SRT_BYTES = 800
+SYNC_ALGO_VERSION = "score-v2"
 
 
 def min_filename_score() -> float:
@@ -88,6 +97,21 @@ def reference_extension(filename: Optional[str]) -> str:
     return ".srt"
 
 
+def _decode_reference_text(data: bytes) -> str:
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        return data.decode("latin-1", errors="replace")
+
+
+def count_reference_events(data: bytes, filename: Optional[str] = None) -> int:
+    text = _decode_reference_text(data)
+    ext = reference_extension(filename)
+    if ext in {".ass", ".ssa"}:
+        return sum(1 for line in text.splitlines() if line.lower().startswith("dialogue:"))
+    return text.count("-->")
+
+
 def save_embedded_reference(data: bytes, filename: Optional[str] = None) -> Optional[Dict[str, Any]]:
     if not data or len(data) > MAX_EMBEDDED_REFERENCE_BYTES:
         ffsubsync_logger().warning(
@@ -95,6 +119,17 @@ def save_embedded_reference(data: bytes, filename: Optional[str] = None) -> Opti
             LOG_PREFIX,
             0 if not data else len(data),
             MAX_EMBEDDED_REFERENCE_BYTES,
+        )
+        return None
+    events = count_reference_events(data, filename)
+    if events < MIN_REFERENCE_EVENTS or len(data) < MIN_REFERENCE_SRT_BYTES:
+        ffsubsync_logger().warning(
+            "%s Rejected embedded reference too thin (bytes=%d events=%d min_bytes=%d min_events=%d)",
+            LOG_PREFIX,
+            len(data),
+            events,
+            MIN_REFERENCE_SRT_BYTES,
+            MIN_REFERENCE_EVENTS,
         )
         return None
     digest = hashlib.sha256(data).hexdigest()
@@ -192,6 +227,7 @@ def make_sync_cache_key(context: Dict[str, Any], sync_meta: Dict[str, Any]) -> s
             sync_meta.get("spa_id") or "",
             sync_meta.get("eng_provider") or "",
             sync_meta.get("eng_id") or "",
+            SYNC_ALGO_VERSION,
         ]
     )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
@@ -248,7 +284,62 @@ def subtitle_bytes_to_srt(data: bytes, extension: str) -> str:
             pass
 
 
-def run_ffsubsync(reference_srt: str, input_srt: str, output_srt: str) -> bool:
+class FfsubsyncAlignment:
+    def __init__(
+        self,
+        score: Optional[float] = None,
+        offset_seconds: Optional[float] = None,
+        scale: Optional[float] = None,
+    ) -> None:
+        self.score = score
+        self.offset_seconds = offset_seconds
+        self.scale = scale
+
+
+def parse_ffsubsync_alignment(stdout: str, stderr: str) -> FfsubsyncAlignment:
+    text = f"{stderr or ''}\n{stdout or ''}"
+    alignment = FfsubsyncAlignment()
+    for line in text.splitlines():
+        lower = line.lower()
+        if "score:" in lower:
+            match = re.search(r"score:\s*([-+]?\d+(?:\.\d+)?)", lower)
+            if match:
+                alignment.score = float(match.group(1))
+        if "offset seconds:" in lower:
+            match = re.search(r"offset seconds:\s*([-+]?\d+(?:\.\d+)?)", lower)
+            if match:
+                alignment.offset_seconds = float(match.group(1))
+        if "framerate scale factor:" in lower:
+            match = re.search(r"framerate scale factor:\s*([-+]?\d+(?:\.\d+)?)", lower)
+            if match:
+                alignment.scale = float(match.group(1))
+    return alignment
+
+
+def alignment_reject_reason(alignment: FfsubsyncAlignment) -> Optional[str]:
+    if alignment.score is None:
+        return "alignment score missing"
+    if alignment.score < MIN_ALIGNMENT_SCORE:
+        return f"alignment score {alignment.score:.1f} below {MIN_ALIGNMENT_SCORE:.0f}"
+    return None
+
+
+def reference_too_thin_reason(reference_srt: str) -> Optional[str]:
+    events = reference_srt.count("-->")
+    nbytes = len(reference_srt.encode("utf-8"))
+    if events < MIN_REFERENCE_EVENTS:
+        return f"reference too thin ({events} events, need {MIN_REFERENCE_EVENTS})"
+    if nbytes < MIN_REFERENCE_SRT_BYTES:
+        return f"reference too small ({nbytes} bytes, need {MIN_REFERENCE_SRT_BYTES})"
+    return None
+
+
+def run_ffsubsync(
+    reference_srt: str,
+    input_srt: str,
+    output_srt: str,
+    extra_args: Optional[list] = None,
+) -> Tuple[bool, FfsubsyncAlignment]:
     cmd = [
         "ffsubsync",
         reference_srt,
@@ -257,6 +348,8 @@ def run_ffsubsync(reference_srt: str, input_srt: str, output_srt: str) -> bool:
         "-o",
         output_srt,
     ]
+    if extra_args:
+        cmd.extend(extra_args)
     start = time.perf_counter()
     logger.info(
         "%s Starting CLI: %s (timeout=%ds)",
@@ -264,6 +357,7 @@ def run_ffsubsync(reference_srt: str, input_srt: str, output_srt: str) -> bool:
         " ".join(cmd),
         ffsubsync_timeout_seconds(),
     )
+    empty = FfsubsyncAlignment()
     try:
         completed = subprocess.run(
             cmd,
@@ -273,15 +367,20 @@ def run_ffsubsync(reference_srt: str, input_srt: str, output_srt: str) -> bool:
             check=False,
         )
         elapsed = time.perf_counter() - start
+        alignment = parse_ffsubsync_alignment(completed.stdout or "", completed.stderr or "")
         if completed.returncode == 0 and os.path.exists(output_srt):
             output_size = os.path.getsize(output_srt)
             logger.info(
-                "%s CLI finished successfully in %.3fs (output_size=%d bytes)",
+                "%s CLI finished successfully in %.3fs (output_size=%d bytes "
+                "score=%s offset=%s scale=%s)",
                 LOG_PREFIX,
                 elapsed,
                 output_size,
+                alignment.score,
+                alignment.offset_seconds,
+                alignment.scale,
             )
-            return True
+            return True, alignment
         logger.warning(
             "%s CLI failed in %.3fs returncode=%s output_exists=%s stderr=%r stdout=%r",
             LOG_PREFIX,
@@ -291,7 +390,7 @@ def run_ffsubsync(reference_srt: str, input_srt: str, output_srt: str) -> bool:
             (completed.stderr or "").strip()[:500],
             (completed.stdout or "").strip()[:500],
         )
-        return False
+        return False, alignment
     except subprocess.TimeoutExpired:
         elapsed = time.perf_counter() - start
         logger.warning(
@@ -300,13 +399,13 @@ def run_ffsubsync(reference_srt: str, input_srt: str, output_srt: str) -> bool:
             elapsed,
             ffsubsync_timeout_seconds(),
         )
-        return False
+        return False, empty
     except FileNotFoundError:
         logger.error("%s ffsubsync binary not found in PATH", LOG_PREFIX)
-        return False
+        return False, empty
     except OSError as exc:
         logger.error("%s CLI OS error: %s", LOG_PREFIX, exc)
-        return False
+        return False, empty
 
 
 def srt_to_vtt(srt_content: str) -> str:
@@ -314,12 +413,16 @@ def srt_to_vtt(srt_content: str) -> str:
     return subs.to_string("vtt")
 
 
-def sync_spanish_with_english_reference(reference_srt: str, spanish_srt: str) -> Optional[str]:
+def sync_spanish_with_english_reference(
+    reference_srt: str,
+    spanish_srt: str,
+) -> Optional[str]:
     ref_lines = reference_srt.count("\n") + 1 if reference_srt else 0
     spa_lines = spanish_srt.count("\n") + 1 if spanish_srt else 0
     start = time.perf_counter()
     logger.info(
-        "%s sync_spanish_with_english_reference started (ref_srt_lines=%d spa_srt_lines=%d ref_bytes=%d spa_bytes=%d)",
+        "%s sync_spanish_with_english_reference started (ref_srt_lines=%d spa_srt_lines=%d "
+        "ref_bytes=%d spa_bytes=%d)",
         LOG_PREFIX,
         ref_lines,
         spa_lines,
@@ -334,19 +437,37 @@ def sync_spanish_with_english_reference(reference_srt: str, spanish_srt: str) ->
             handle.write(reference_srt)
         with open(input_path, "w", encoding="utf-8") as handle:
             handle.write(spanish_srt)
-        if not run_ffsubsync(reference_path, input_path, output_path):
+        ok, alignment = run_ffsubsync(reference_path, input_path, output_path)
+        if not ok:
             elapsed = time.perf_counter() - start
             logger.warning("%s sync_spanish_with_english_reference failed in %.3fs", LOG_PREFIX, elapsed)
+            return None
+        reject = alignment_reject_reason(alignment)
+        if reject:
+            elapsed = time.perf_counter() - start
+            logger.warning(
+                "%s rejected alignment in %.3fs reason=%s score=%s offset=%s scale=%s",
+                LOG_PREFIX,
+                elapsed,
+                reject,
+                alignment.score,
+                alignment.offset_seconds,
+                alignment.scale,
+            )
             return None
         with open(output_path, "r", encoding="utf-8") as handle:
             synced_srt = handle.read()
         synced_vtt = srt_to_vtt(synced_srt)
         elapsed = time.perf_counter() - start
         logger.info(
-            "%s sync_spanish_with_english_reference finished in %.3fs (output_vtt_bytes=%d)",
+            "%s sync_spanish_with_english_reference finished in %.3fs "
+            "(output_vtt_bytes=%d score=%s offset=%s scale=%s)",
             LOG_PREFIX,
             elapsed,
             len(synced_vtt.encode("utf-8")),
+            alignment.score,
+            alignment.offset_seconds,
+            alignment.scale,
         )
         return synced_vtt
 
@@ -486,8 +607,21 @@ async def maybe_apply_ffsubsync(user, vtt_content: str, context: Dict[str, Any],
             len(spanish_srt.encode("utf-8")),
         )
 
+        thin = reference_too_thin_reason(reference_srt)
+        if thin:
+            logger.warning(
+                "%s Skip sync content_id=%s: %s",
+                LOG_PREFIX,
+                content_id,
+                thin,
+            )
+            return None
+
         sync_start = time.perf_counter()
-        synced_vtt = sync_spanish_with_english_reference(reference_srt, spanish_srt)
+        synced_vtt = sync_spanish_with_english_reference(
+            reference_srt,
+            spanish_srt,
+        )
         sync_elapsed = time.perf_counter() - sync_start
 
         if not synced_vtt:

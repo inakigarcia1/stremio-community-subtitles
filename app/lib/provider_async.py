@@ -27,6 +27,8 @@ async def search_providers_parallel(user, active_providers, search_params, timeo
         search_params.get("video_size"),
         search_params.get("video_filename"),
         languages,
+        search_params.get("season"),
+        search_params.get("episode"),
     )
 
     provider_names = [p.name for p in active_providers]

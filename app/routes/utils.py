@@ -669,6 +669,7 @@ async def _find_best_match_by_filename(user, content_id, imdb_id, video_filename
             
             search_params = {
                 'imdb_id': imdb_id,
+                'content_id': content_id,
                 'languages': [lang],
                 'season': season,
                 'episode': episode,
@@ -775,6 +776,7 @@ async def _find_fallback_subtitle(user, content_id, imdb_id, content_type, lang,
             
             search_params = {
                 'imdb_id': imdb_id,
+                'content_id': content_id,
                 'languages': [lang],
                 'season': season,
                 'episode': episode,
@@ -906,12 +908,27 @@ def generate_vtt_message(message: str) -> str:
     return f"WEBVTT\n\n00:00:00.000 --> 00:00:08.000\n{message}"
 
 
+def looks_like_html_payload(payload: bytes) -> bool:
+    head = (payload or b"").lstrip()[:64].lower()
+    return (
+        head.startswith(b"<!doctype")
+        or head.startswith(b"<html")
+        or head.startswith(b"<head")
+        or head.startswith(b"<title")
+    )
+
+
 def extract_subtitle_from_zip(zip_content: bytes, episode: int = None):
     """
     Extracts subtitle file from ZIP or RAR archive.
     If episode is provided, tries to find file matching episode number.
     Returns tuple: (subtitle_content: bytes, filename: str, extension: str)
     """
+    if looks_like_html_payload(zip_content):
+        raise ValueError(
+            "Provider returned HTML instead of an archive. First 20 bytes: "
+            f"{zip_content[:20].hex() if zip_content else ''}"
+        )
     subtitle_extensions = ['.srt', '.vtt', '.ass', '.ssa', '.sub', '.smi']
     
     # Build episode matching patterns (both zero-padded and non-padded)

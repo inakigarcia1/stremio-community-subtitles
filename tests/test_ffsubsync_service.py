@@ -22,6 +22,20 @@ sync_spanish_with_english_reference = ffsubsync_service.sync_spanish_with_englis
 write_cached_vtt = ffsubsync_service.write_cached_vtt
 
 
+def _dense_reference_srt(events: int = 24) -> str:
+    blocks = []
+    for index in range(events):
+        start = index * 20
+        minutes = start // 60
+        seconds = start % 60
+        blocks.append(
+            f"{index + 1}\n"
+            f"00:{minutes:02d}:{seconds:02d},000 --> 00:{minutes:02d}:{seconds:02d},800\n"
+            f"Reference line {index} spoken clearly\n"
+        )
+    return "\n".join(blocks)
+
+
 REFERENCE_SRT = """1
 00:00:01,000 --> 00:00:03,000
 Hello world
@@ -30,6 +44,8 @@ Hello world
 00:00:05,000 --> 00:00:07,000
 Second line
 """
+
+DENSE_REFERENCE_SRT = _dense_reference_srt()
 
 UNSYNCED_SPANISH_SRT = """1
 00:00:04,000 --> 00:00:06,000
@@ -96,20 +112,67 @@ def test_save_and_read_embedded_reference(tmp_path, monkeypatch):
     save_embedded_reference = ffsubsync_service.save_embedded_reference
     read_embedded_reference_bytes = ffsubsync_service.read_embedded_reference_bytes
 
-    saved = save_embedded_reference(REFERENCE_SRT.encode("utf-8"), "ref.srt")
+    saved = save_embedded_reference(DENSE_REFERENCE_SRT.encode("utf-8"), "ref.srt")
     assert saved is not None
     assert saved["provider_name"] == "embedded"
     loaded = read_embedded_reference_bytes(saved["provider_subtitle_id"])
     assert loaded is not None
     data, ext = loaded
     assert ext == ".srt"
-    assert b"Hello world" in data
+    assert b"Reference line 0" in data
 
 
 def test_save_embedded_reference_rejects_oversized(tmp_path, monkeypatch):
     monkeypatch.setenv("FFSUBSYNC_EMBEDDED_DIR", str(tmp_path))
     huge = b"x" * (ffsubsync_service.MAX_EMBEDDED_REFERENCE_BYTES + 1)
     assert ffsubsync_service.save_embedded_reference(huge, "ref.srt") is None
+
+
+def test_save_embedded_reference_rejects_thin_sample(tmp_path, monkeypatch):
+    monkeypatch.setenv("FFSUBSYNC_EMBEDDED_DIR", str(tmp_path))
+    assert ffsubsync_service.save_embedded_reference(REFERENCE_SRT.encode("utf-8"), "ref.srt") is None
+
+
+def test_reference_too_thin_reason():
+    assert ffsubsync_service.reference_too_thin_reason(REFERENCE_SRT) is not None
+    assert ffsubsync_service.reference_too_thin_reason(DENSE_REFERENCE_SRT) is None
+
+
+def test_parse_and_reject_ep9_style_alignment():
+    alignment = ffsubsync_service.parse_ffsubsync_alignment(
+        "",
+        "INFO     score: 5327.837\nINFO     offset seconds: 16.210\nINFO     framerate scale factor: 1.043",
+    )
+    assert alignment.score == pytest.approx(5327.837)
+    assert alignment.offset_seconds == pytest.approx(16.210)
+    assert alignment.scale == pytest.approx(1.043)
+    assert ffsubsync_service.alignment_reject_reason(alignment) is not None
+
+
+def test_accepts_ep8_style_alignment():
+    alignment = ffsubsync_service.parse_ffsubsync_alignment(
+        "",
+        "INFO     score: 27938.426\nINFO     offset seconds: 2.060\nINFO     framerate scale factor: 1.001",
+    )
+    assert ffsubsync_service.alignment_reject_reason(alignment) is None
+
+
+def test_accepts_high_score_with_nontrivial_framerate_scale():
+    alignment = ffsubsync_service.parse_ffsubsync_alignment(
+        "",
+        "INFO     score: 22104.5\nINFO     offset seconds: 1.250\nINFO     framerate scale factor: 1.042",
+    )
+    assert ffsubsync_service.alignment_reject_reason(alignment) is None
+
+
+def test_rejects_missing_or_negative_score():
+    missing = ffsubsync_service.parse_ffsubsync_alignment("", "INFO     offset seconds: 1.0")
+    assert ffsubsync_service.alignment_reject_reason(missing) is not None
+    negative = ffsubsync_service.parse_ffsubsync_alignment(
+        "",
+        "INFO     score: -5816.0\nINFO     offset seconds: 52.66\nINFO     framerate scale factor: 0.405",
+    )
+    assert ffsubsync_service.alignment_reject_reason(negative) is not None
 
 
 def test_make_sync_cache_key_includes_embedded_id():

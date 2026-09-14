@@ -32,7 +32,11 @@ def make_cache_key(
     video_size: Optional[int],
     video_filename: Optional[str],
     languages: List[str],
+    season: Optional[int] = None,
+    episode: Optional[int] = None,
 ) -> str:
+    # season/episode are part of the key: callers that only pass a series-level
+    # imdb_id would otherwise share one entry across every episode.
     payload = "|".join([
         content_type or "",
         content_id or "",
@@ -40,6 +44,8 @@ def make_cache_key(
         str(video_size) if video_size is not None else "",
         video_filename or "",
         ",".join(sorted(languages or [])),
+        str(season) if season is not None else "",
+        str(episode) if episode is not None else "",
     ])
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 

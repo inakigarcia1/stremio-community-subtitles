@@ -27,7 +27,7 @@ try:
     CLOUDINARY_AVAILABLE = True
 except ImportError:
     CLOUDINARY_AVAILABLE = False
-from ..extensions import async_session_maker
+from ..extensions import async_session_maker, csrf
 from ..models import User, Subtitle, UserActivity, UserSubtitleSelection, SubtitleVote  
 from ..lib.subtitles import convert_to_vtt, normalize_vtt_for_players
 from ..lib.service_user import get_service_user
@@ -115,6 +115,7 @@ async def _load_embedded_reference_from_request(content_id: str):
 
 @subtitles_bp.route('/subtitles/<content_type>/<content_id>.json', methods=['GET', 'POST'])
 @subtitles_bp.route('/subtitles/<content_type>/<content_id>/<path:params>', methods=['GET', 'POST'])
+@csrf.exempt
 async def service_addon_stream(content_type: str, content_id: str, params: str = None):
     """Tokenless subtitle search for the internal Apachiy service user."""
     user = await get_service_user()
@@ -169,9 +170,15 @@ async def _handle_addon_stream(user, content_type: str, content_id: str, params:
         return respond_with({'subtitles': []})
 
     embedded_reference = await _load_embedded_reference_from_request(content_id)
-    if request.method != 'POST':
+    if embedded_reference:
         ffsubsync_log.info(
-            "[ffsubsync] %s: GET request — no client embedded reference upload",
+            "[ffsubsync] %s: using client embedded reference lang=%s",
+            content_id,
+            embedded_reference.get('lang', 'unknown'),
+        )
+    else:
+        ffsubsync_log.info(
+            "[ffsubsync] %s: no client embedded reference",
             content_id,
         )
 
@@ -624,8 +631,23 @@ async def _unified_download_for_user(user, download_identifier: str):
         current_app.logger.error(f"Failed to decode download identifier '{download_identifier}': {e}")
         return NoCacheResponse(generate_vtt_message("Invalid download link."), status=400, mimetype='text/vtt')
 
-    # Use the utility function to get active subtitle details (now with OpenSubtitles fallback)
-    active_subtitle_info = await get_active_subtitle_details(user, content_id, video_hash, content_type, video_filename, lang, season, episode)
+    announced = context.get('sync') or {}
+    announced_provider = announced.get('spa_provider')
+    announced_id = announced.get('spa_id')
+    if lang == 'spa' and announced_provider and announced_id:
+        active_subtitle_info = {
+            'type': f'{announced_provider}_auto',
+            'provider_name': announced_provider,
+            'provider_subtitle_id': str(announced_id),
+            'provider_metadata': {},
+            'subtitle': None,
+            'details': None,
+            'auto': True,
+        }
+    else:
+        active_subtitle_info = await get_active_subtitle_details(
+            user, content_id, video_hash, content_type, video_filename, lang, season, episode
+        )
 
     local_subtitle_to_serve = None
     provider_subtitle_to_serve = None
@@ -820,58 +842,66 @@ async def _unified_download_for_user(user, download_identifier: str):
                     r.raise_for_status()
                     body = await r.read()
 
-                    # Check if response is ZIP (SubDL URLs often end with .zip?api_key=...)
-                    content_type = r.headers.get('Content-Type', '')
-                    url_path = provider_subtitle_url.split('?', 1)[0].lower()
-                    is_zip_response = (
-                        'zip' in content_type.lower()
-                        or url_path.endswith('.zip')
-                        or (len(body) >= 2 and body[:2] == b'PK')
-                    )
-                    if is_zip_response:
-                        from .utils import extract_subtitle_from_zip, process_subtitle_content
-                        
-                        try:
-                            zip_data = body
-                            current_app.logger.info(
-                                f"Downloaded ZIP from {provider_subtitle_url}, "
-                                f"size={len(zip_data)}, "
-                                f"first_bytes={zip_data[:20].hex() if len(zip_data) >= 20 else zip_data.hex()}"
-                            )
-                            subtitle_content, filename, extension = extract_subtitle_from_zip(zip_data, episode=episode)
-                            del zip_data
-                            
-                            # Process subtitle (convert to VTT, handle ASS)
-                            processed = await process_subtitle_content(subtitle_content, extension)
-                            del subtitle_content  # Free memory
-                            
-                            # If ASS requested and available, serve original
-                            if is_ass_request and processed['original']:
-                                current_app.logger.info(f"Serving ASS format from provider ZIP")
-                                result = NoCacheResponse(processed['original'], mimetype='text/x-ssa')
-                                return result
-                            elif is_ass_request:
-                                # ASS requested but not available - serve VTT instead
-                                current_app.logger.info(f"ASS requested but not in ZIP, serving VTT")
-                            
-                            vtt_content = processed['vtt']
-                        except ValueError as e:
-                            if "No subtitle file found in" in str(e):
-                                current_app.logger.warning(f"Provider archive contains no subtitle files (url={provider_subtitle_url}): {e}")
-                                message_key = 'provider_no_subtitle_in_archive'
-                            else:
-                                current_app.logger.error(f"Error processing ZIP subtitle (url={provider_subtitle_url}, content_type={content_type}, response_size={len(body)}): {e}", exc_info=True)
-                                message_key = 'error'
-                        except Exception as e:
-                            current_app.logger.error(f"Error processing ZIP subtitle (url={provider_subtitle_url}, content_type={content_type}): {e}", exc_info=True)
-                            message_key = 'error'
+                    from .utils import looks_like_html_payload
+                    if looks_like_html_payload(body):
+                        current_app.logger.warning(
+                            "Provider download returned HTML instead of a subtitle url=%s size=%d",
+                            provider_subtitle_url.split('?', 1)[0],
+                            len(body),
+                        )
+                        message_key = 'provider_download_error'
+                        failed_provider_name = provider_subtitle_to_serve.get('provider')
+                        failed_provider_error = 'Provider returned HTML instead of a subtitle file'
                     else:
-                        # Plain text subtitle (VTT/SRT)
-                        if is_ass_request:
-                            current_app.logger.info(
-                                "ASS requested but provider returned plain text, serving as VTT"
+                        # Check if response is ZIP (SubDL URLs often end with .zip?api_key=...)
+                        content_type = r.headers.get('Content-Type', '')
+                        is_zip_response = (
+                            (len(body) >= 2 and body[:2] == b'PK')
+                            or body[:4] == b'Rar!'
+                            or (
+                                'zip' in content_type.lower()
+                                and 'html' not in content_type.lower()
                             )
-                        vtt_content = body.decode('utf-8', errors='replace')
+                        )
+                        if is_zip_response:
+                            from .utils import extract_subtitle_from_zip, process_subtitle_content
+                            try:
+                                zip_data = body
+                                current_app.logger.info(
+                                    f"Downloaded ZIP from {provider_subtitle_url}, "
+                                    f"size={len(zip_data)}, "
+                                    f"first_bytes={zip_data[:20].hex() if len(zip_data) >= 20 else zip_data.hex()}"
+                                )
+                                subtitle_content, filename, extension = extract_subtitle_from_zip(zip_data, episode=episode)
+                                del zip_data
+
+                                processed = await process_subtitle_content(subtitle_content, extension)
+                                del subtitle_content
+
+                                if is_ass_request and processed['original']:
+                                    current_app.logger.info(f"Serving ASS format from provider ZIP")
+                                    result = NoCacheResponse(processed['original'], mimetype='text/x-ssa')
+                                    return result
+                                elif is_ass_request:
+                                    current_app.logger.info(f"ASS requested but not in ZIP, serving VTT")
+
+                                vtt_content = processed['vtt']
+                            except ValueError as e:
+                                if "No subtitle file found in" in str(e):
+                                    current_app.logger.warning(f"Provider archive contains no subtitle files (url={provider_subtitle_url}): {e}")
+                                    message_key = 'provider_no_subtitle_in_archive'
+                                else:
+                                    current_app.logger.error(f"Error processing ZIP subtitle (url={provider_subtitle_url}, content_type={content_type}, response_size={len(body)}): {e}", exc_info=True)
+                                    message_key = 'error'
+                            except Exception as e:
+                                current_app.logger.error(f"Error processing ZIP subtitle (url={provider_subtitle_url}, content_type={content_type}): {e}", exc_info=True)
+                                message_key = 'error'
+                        else:
+                            if is_ass_request:
+                                current_app.logger.info(
+                                    "ASS requested but provider returned plain text, serving as VTT"
+                                )
+                            vtt_content = body.decode('utf-8', errors='replace')
         except asyncio.TimeoutError:
             current_app.logger.warning(f"Timeout fetching subtitle from {provider_subtitle_url}")
             message_key = 'provider_timeout'
