@@ -346,8 +346,6 @@ async def request_download_link(file_id, user=None):
                 return await response.json()
 
     try:
-        current_app.logger.info(
-            f"Requesting OpenSubtitles download link (authenticated) for file_id: {file_id} at {user.opensubtitles_base_url}/api/v1/download")
         data = await make_request_with_retry(make_request)
         return data
     except aiohttp.ClientResponseError as e:

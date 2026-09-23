@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import os
 import re
@@ -42,8 +43,9 @@ ALLOWED_REFERENCE_EXTENSIONS = {".srt", ".vtt", ".ass", ".ssa"}
 # Reject the CLI result only when ffsubsync itself reports a weak match.
 # A non-1.0 scale is how PAL/NTSC (and similar) remuxes get fixed; ep8 was
 # score=27938 / scale=1.001. Garbage alignments show up as low/negative scores
-# (ep9=5327, ep15=-5816), not as "scale != 1".
-MIN_ALIGNMENT_SCORE = 12000.0
+# (ep9=5327, ep15=-5816), not as "scale != 1". S02E01 scored 11056 with
+# offset=2.01 / scale=1.001 — applying that beat serving the unsynced file.
+MIN_ALIGNMENT_SCORE = 10000.0
 MIN_REFERENCE_EVENTS = 24
 MIN_REFERENCE_SRT_BYTES = 800
 SYNC_ALGO_VERSION = "score-v2"
@@ -233,8 +235,96 @@ def make_sync_cache_key(context: Dict[str, Any], sync_meta: Dict[str, Any]) -> s
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def playback_identity_key(context: Dict[str, Any]) -> str:
+    payload = "|".join(
+        [
+            context.get("content_id") or "",
+            context.get("v_hash") or "",
+            str(context.get("v_size") if context.get("v_size") is not None else ""),
+            context.get("v_fname") or "",
+            SYNC_ALGO_VERSION,
+        ]
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _playback_index_path(identity: str) -> str:
+    return os.path.join(sync_cache_dir(), f"{identity}.playback.json")
+
+
+def remember_playback_sync(context: Dict[str, Any], sync_meta: Dict[str, Any]) -> None:
+    cache_key = make_sync_cache_key(context, sync_meta)
+    if read_cached_vtt(cache_key) is None:
+        return
+    path = _playback_index_path(playback_identity_key(context))
+    payload = {"sync": sync_meta, "cache_key": cache_key}
+    temporary = f"{path}.tmp"
+    with open(temporary, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle)
+    os.replace(temporary, path)
+
+
+def lookup_playback_sync(context: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    path = _playback_index_path(playback_identity_key(context))
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return None
+    cache_key = payload.get("cache_key")
+    sync = payload.get("sync") or {}
+    if not cache_key or read_cached_vtt(cache_key) is None:
+        return None
+    return {"sync": sync, "cache_key": cache_key}
+
+
 def _cache_file_path(cache_key: str) -> str:
     return os.path.join(sync_cache_dir(), f"{cache_key}.vtt")
+
+
+def _score_file_path(cache_key: str) -> str:
+    return os.path.join(sync_cache_dir(), f"{cache_key}.score.json")
+
+
+def log_ffsubsync_score(
+    content_id: str,
+    alignment: Optional["FfsubsyncAlignment"],
+    *,
+    accepted: bool,
+    cached: bool = False,
+    reason: Optional[str] = None,
+    cache_key: Optional[str] = None,
+) -> None:
+    if accepted and cache_key and alignment is not None:
+        write_cached_alignment(cache_key, alignment)
+
+
+def write_cached_alignment(cache_key: str, alignment: "FfsubsyncAlignment") -> None:
+    payload = {
+        "score": alignment.score,
+        "offset_seconds": alignment.offset_seconds,
+        "scale": alignment.scale,
+    }
+    with open(_score_file_path(cache_key), "w", encoding="utf-8") as handle:
+        json.dump(payload, handle)
+
+
+def read_cached_alignment(cache_key: str) -> Optional["FfsubsyncAlignment"]:
+    path = _score_file_path(cache_key)
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        return FfsubsyncAlignment(
+            score=payload.get("score"),
+            offset_seconds=payload.get("offset_seconds"),
+            scale=payload.get("scale"),
+        )
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return None
 
 
 def read_cached_vtt(cache_key: str) -> Optional[str]:
@@ -245,6 +335,10 @@ def read_cached_vtt(cache_key: str) -> Optional[str]:
     if age > sync_cache_ttl_seconds():
         try:
             os.remove(path)
+        except OSError:
+            pass
+        try:
+            os.remove(_score_file_path(cache_key))
         except OSError:
             pass
         logger.info(
@@ -416,6 +510,8 @@ def srt_to_vtt(srt_content: str) -> str:
 def sync_spanish_with_english_reference(
     reference_srt: str,
     spanish_srt: str,
+    content_id: str = "?",
+    cache_key: Optional[str] = None,
 ) -> Optional[str]:
     ref_lines = reference_srt.count("\n") + 1 if reference_srt else 0
     spa_lines = spanish_srt.count("\n") + 1 if spanish_srt else 0
@@ -441,6 +537,7 @@ def sync_spanish_with_english_reference(
         if not ok:
             elapsed = time.perf_counter() - start
             logger.warning("%s sync_spanish_with_english_reference failed in %.3fs", LOG_PREFIX, elapsed)
+            log_ffsubsync_score(content_id, alignment, accepted=False, reason="cli_failed")
             return None
         reject = alignment_reject_reason(alignment)
         if reject:
@@ -454,6 +551,7 @@ def sync_spanish_with_english_reference(
                 alignment.offset_seconds,
                 alignment.scale,
             )
+            log_ffsubsync_score(content_id, alignment, accepted=False, reason=reject)
             return None
         with open(output_path, "r", encoding="utf-8") as handle:
             synced_srt = handle.read()
@@ -469,6 +567,7 @@ def sync_spanish_with_english_reference(
             alignment.offset_seconds,
             alignment.scale,
         )
+        log_ffsubsync_score(content_id, alignment, accepted=True, cache_key=cache_key)
         return synced_vtt
 
 
@@ -489,12 +588,6 @@ async def maybe_apply_ffsubsync(user, vtt_content: str, context: Dict[str, Any],
     from ..lib.subtitles import normalize_vtt_for_players
 
     content_id = context.get("content_id", "?")
-    if ffsubsync_force_always():
-        logger.warning(
-            "%s FFSUBSYNC_FORCE_ALWAYS enabled — skipping score/hash gates for content_id=%s",
-            LOG_PREFIX,
-            content_id,
-        )
     skip_reason = ffsubsync_skip_reason(sync_meta)
     eng_source = describe_eng_reference_source(sync_meta)
     if skip_reason:
@@ -512,35 +605,21 @@ async def maybe_apply_ffsubsync(user, vtt_content: str, context: Dict[str, Any],
         )
         return None
 
-    total_start = time.perf_counter()
-    ffsubsync_logger().info(
-        "%s Running sync content_id=%s eng_source=%s match_kind=%s filename_score=%s "
-        "spa=%s/%s input_vtt_bytes=%d",
-        LOG_PREFIX,
-        content_id,
-        eng_source,
-        sync_meta.get("match_kind"),
-        sync_meta.get("filename_score"),
-        sync_meta.get("spa_provider"),
-        sync_meta.get("spa_id"),
-        len(vtt_content.encode("utf-8")),
-    )
-
     cache_key = make_sync_cache_key(context, sync_meta)
     cached = read_cached_vtt(cache_key)
     if cached:
-        total_elapsed = time.perf_counter() - total_start
-        logger.info(
-            "%s Cache HIT content_id=%s cache_key=%s cached_bytes=%d lookup_time=%.3fs",
+        cached_alignment = read_cached_alignment(cache_key)
+        offset = cached_alignment.offset_seconds if cached_alignment else None
+        ffsubsync_logger().info(
+            "%s %s: sync cache hit eng=%s/%s offset=%ss",
             LOG_PREFIX,
             content_id,
-            cache_key,
-            len(cached.encode("utf-8")),
-            total_elapsed,
+            sync_meta.get("eng_provider"),
+            sync_meta.get("eng_id"),
+            offset,
         )
+        remember_playback_sync(context, sync_meta)
         return cached
-
-    logger.info("%s Cache MISS content_id=%s cache_key=%s", LOG_PREFIX, content_id, cache_key)
 
     eng_provider = sync_meta.get("eng_provider")
     eng_id = sync_meta.get("eng_id")
@@ -552,15 +631,10 @@ async def maybe_apply_ffsubsync(user, vtt_content: str, context: Dict[str, Any],
         )
         return None
 
+    total_start = time.perf_counter()
     try:
         download_start = time.perf_counter()
         if eng_provider == EMBEDDED_PROVIDER:
-            ffsubsync_logger().info(
-                "%s Loading English reference from CLIENT EMBEDDED upload content_id=%s hash=%s",
-                LOG_PREFIX,
-                content_id,
-                eng_id,
-            )
             embedded = read_embedded_reference_bytes(str(eng_id))
             if embedded is None:
                 ffsubsync_logger().warning(
@@ -572,40 +646,14 @@ async def maybe_apply_ffsubsync(user, vtt_content: str, context: Dict[str, Any],
                 return None
             eng_bytes, eng_ext = embedded
         else:
-            ffsubsync_logger().info(
-                "%s Loading English reference from COMMUNITY provider content_id=%s provider=%s id=%s",
-                LOG_PREFIX,
-                content_id,
-                eng_provider,
-                eng_id,
-            )
             from ..routes.utils import download_provider_subtitle_bytes
             eng_bytes, eng_ext = await download_provider_subtitle_bytes(user, eng_provider, eng_id, episode=episode)
         download_elapsed = time.perf_counter() - download_start
-        ref_source = "client embedded" if eng_provider == EMBEDDED_PROVIDER else f"community/{eng_provider}"
-        ffsubsync_logger().info(
-            "%s English reference loaded in %.3fs content_id=%s source=%s id=%s ext=%s bytes=%d",
-            LOG_PREFIX,
-            download_elapsed,
-            content_id,
-            ref_source,
-            eng_id,
-            eng_ext,
-            len(eng_bytes),
-        )
 
         convert_start = time.perf_counter()
         reference_srt = subtitle_bytes_to_srt(eng_bytes, eng_ext)
         spanish_srt = SSAFile.from_string(vtt_content).to_string("srt")
         convert_elapsed = time.perf_counter() - convert_start
-        logger.info(
-            "%s Converted to SRT in %.3fs content_id=%s ref_srt_bytes=%d spa_srt_bytes=%d",
-            LOG_PREFIX,
-            convert_elapsed,
-            content_id,
-            len(reference_srt.encode("utf-8")),
-            len(spanish_srt.encode("utf-8")),
-        )
 
         thin = reference_too_thin_reason(reference_srt)
         if thin:
@@ -621,6 +669,8 @@ async def maybe_apply_ffsubsync(user, vtt_content: str, context: Dict[str, Any],
         synced_vtt = sync_spanish_with_english_reference(
             reference_srt,
             spanish_srt,
+            content_id=content_id,
+            cache_key=cache_key,
         )
         sync_elapsed = time.perf_counter() - sync_start
 
@@ -642,21 +692,17 @@ async def maybe_apply_ffsubsync(user, vtt_content: str, context: Dict[str, Any],
 
         synced_vtt = normalize_vtt_for_players(synced_vtt)
         write_cached_vtt(cache_key, synced_vtt)
-        total_elapsed = time.perf_counter() - total_start
+        alignment = read_cached_alignment(cache_key)
         ffsubsync_logger().info(
-            "%s Sync SUCCEEDED content_id=%s eng_source=%s sync_time=%.3fs total_time=%.3fs "
-            "input_vtt_bytes=%d output_vtt_bytes=%d spa=%s/%s cache_key=%s",
+            "%s %s: synced Spanish eng=%s/%s offset=%ss scale=%s",
             LOG_PREFIX,
             content_id,
-            "client embedded" if eng_provider == EMBEDDED_PROVIDER else f"community/{eng_provider}",
-            sync_elapsed,
-            total_elapsed,
-            len(vtt_content.encode("utf-8")),
-            len(synced_vtt.encode("utf-8")),
-            sync_meta.get("spa_provider"),
-            sync_meta.get("spa_id"),
-            cache_key,
+            eng_provider,
+            eng_id,
+            alignment.offset_seconds if alignment else None,
+            alignment.scale if alignment else None,
         )
+        remember_playback_sync(context, sync_meta)
         return synced_vtt
     except Exception:
         total_elapsed = time.perf_counter() - total_start

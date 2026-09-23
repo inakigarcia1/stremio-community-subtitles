@@ -60,12 +60,6 @@ async def _load_embedded_reference_from_request(content_id: str):
         return None
     upload = files.get(EMBEDDED_REFERENCE_FORM_FIELD) if files else None
     if upload is None:
-        log.info(
-            "[ffsubsync] %s: POST received but no '%s' file "
-            "(will search community English reference if needed)",
-            content_id,
-            EMBEDDED_REFERENCE_FORM_FIELD,
-        )
         return None
     upload_name = getattr(upload, 'filename', None) or '(unknown)'
     try:
@@ -101,15 +95,6 @@ async def _load_embedded_reference_from_request(content_id: str):
             saved['lang'] = lang
     except Exception:
         pass
-    log.info(
-        "[ffsubsync] %s: client embedded reference ACCEPTED hash=%s ext=%s bytes=%d filename=%s lang=%s",
-        content_id,
-        saved.get('provider_subtitle_id'),
-        saved.get('ext'),
-        len(data),
-        upload_name,
-        saved.get('lang', 'unknown'),
-    )
     return saved
 
 
@@ -165,22 +150,18 @@ async def _handle_addon_stream(user, content_type: str, content_id: str, params:
     video_filename = parsed_params.get('filename')
     video_filename = sanitize_filename(video_filename)
 
+    video_size = None
+    if video_size_str:
+        try:
+            video_size = int(video_size_str)
+        except ValueError:
+            current_app.logger.warning(f"Could not convert videoSize '{video_size_str}' to integer. URL: {request.url}")
+
     if video_filename and video_filename.endswith(".docc"):
         current_app.logger.info(f"Ignoring as those are probably from the Docchi extension with hardcoded subs")
         return respond_with({'subtitles': []})
 
     embedded_reference = await _load_embedded_reference_from_request(content_id)
-    if embedded_reference:
-        ffsubsync_log.info(
-            "[ffsubsync] %s: using client embedded reference lang=%s",
-            content_id,
-            embedded_reference.get('lang', 'unknown'),
-        )
-    else:
-        ffsubsync_log.info(
-            "[ffsubsync] %s: no client embedded reference",
-            content_id,
-        )
 
     has_embedded_spanish = parsed_params.get('hasEmbeddedSpanish', '').strip().lower() in {'1', 'true', 'yes'}
     if has_embedded_spanish:
@@ -189,12 +170,16 @@ async def _handle_addon_stream(user, content_type: str, content_id: str, params:
         )
         return respond_with_no_cache({'subtitles': []})
 
-    video_size = None
-    if video_size_str:
-        try:
-            video_size = int(video_size_str)
-        except ValueError:
-            current_app.logger.warning(f"Could not convert videoSize '{video_size_str}' to integer. URL: {request.url}")
+    if embedded_reference:
+        from ..lib.embedded_reference_index import save_embedded_index
+
+        save_embedded_index(
+            content_id,
+            video_hash,
+            video_size,
+            video_filename,
+            embedded_reference,
+        )
 
     # Allow language override via query param (e.g. ?langs=eng,spa,pol)
     langs_override = parsed_params.get('langs')
@@ -204,6 +189,48 @@ async def _handle_addon_stream(user, content_type: str, content_id: str, params:
         preferred_langs = user.preferred_languages
     current_app.logger.info(
         f"Subtitle request: User={user.username}, Lang={','.join(preferred_langs)}, Content={content_type}/{content_id}, Hash={video_hash}, Size={video_size}, Filename={video_filename}")
+
+    if 'spa' in preferred_langs:
+        from ..lib.ffsubsync_service import lookup_playback_sync
+        playback_context = {
+            'content_type': content_type,
+            'content_id': content_id,
+            'lang': 'spa',
+            'v_hash': video_hash,
+            'v_size': video_size,
+            'v_fname': video_filename,
+        }
+        remembered = lookup_playback_sync(playback_context)
+        if remembered:
+            playback_context['sync'] = remembered['sync']
+            context_json = json.dumps(playback_context, separators=(',', ':'))
+            download_identifier = base64.urlsafe_b64encode(context_json.encode('utf-8')).decode('utf-8').rstrip('=')
+            if manifest_token:
+                download_url = url_for(
+                    'subtitles.unified_download',
+                    manifest_token=manifest_token,
+                    download_identifier=download_identifier,
+                    _external=True,
+                    _scheme=current_app.config['PREFERRED_URL_SCHEME'],
+                )
+            else:
+                download_url = url_for(
+                    'subtitles.service_unified_download',
+                    download_identifier=download_identifier,
+                    _external=True,
+                    _scheme=current_app.config['PREFERRED_URL_SCHEME'],
+                )
+            ffsubsync_log.info(
+                "[ffsubsync] %s: listing cache hit, skipped provider search",
+                content_id,
+            )
+            return respond_with_no_cache({
+                'subtitles': [{
+                    'id': f"{content_id}_spa",
+                    'url': download_url,
+                    'lang': 'spa',
+                }],
+            })
 
     # Log user activity (fire-and-forget — don't block subtitle response)
     async def _log_activity():
@@ -341,9 +368,9 @@ async def _handle_addon_stream(user, content_type: str, content_id: str, params:
                 active_providers = await ProviderRegistry.get_active_for_user(user)
                 
                 if active_providers:
-                    search_langs = list(preferred_langs)
-                    if 'spa' in search_langs and 'eng' not in search_langs and not embedded_reference:
-                        search_langs.append('eng')
+                    from ..lib.embedded_reference_index import listing_search_languages
+
+                    search_langs = listing_search_languages(list(preferred_langs), embedded_reference)
                     search_params = {
                         'imdb_id': imdb_id,
                         'content_id': content_id,
@@ -356,61 +383,28 @@ async def _handle_addon_stream(user, content_type: str, content_id: str, params:
                         'video_filename': video_filename
                     }
                     cached_provider_results = await search_providers_parallel(user, active_providers, search_params, timeout=10)
-                    current_app.logger.info(f"Pre-searched providers for {len(search_langs)} languages: {list(cached_provider_results.keys())}")
+                    current_app.logger.info(
+                        "Provider search: %s",
+                        ", ".join(cached_provider_results.keys()) or "none",
+                    )
             except Exception as e:
                 current_app.logger.error(f"Error in provider pre-search: {e}", exc_info=True)
 
     # Parallel search for all languages
     async def process_language(preferred_lang):
+        from ..lib.embedded_reference_index import (
+            embedded_meta_to_english_reference,
+            lookup_embedded_index,
+            save_listing_sidecar,
+        )
+
         english_reference = None
-        if preferred_lang == 'spa' and embedded_reference:
-            english_reference = embedded_reference
-            ffsubsync_log.info(
-                "[ffsubsync] %s: sync reference = CLIENT EMBEDDED hash=%s ext=%s lang=%s "
-                "(skipping community English search)",
-                content_id,
-                embedded_reference.get('provider_subtitle_id'),
-                embedded_reference.get('ext'),
-                embedded_reference.get('lang', 'unknown'),
-            )
-        elif preferred_lang == 'spa':
-            ffsubsync_log.info(
-                "[ffsubsync] %s: no client embedded reference — searching community English",
-                content_id,
-            )
-            try:
-                english_reference = await get_active_subtitle_details(
-                    user,
-                    content_id,
-                    video_hash,
-                    content_type,
-                    video_filename,
-                    'eng',
-                    cached_provider_results=cached_provider_results,
-                )
-            except Exception as e:
-                ffsubsync_log.warning(
-                    "[ffsubsync] %s: community English search failed: %s",
-                    content_id,
-                    e,
-                )
-            else:
-                if english_reference and english_reference.get("type") != "none":
-                    ffsubsync_log.info(
-                        "[ffsubsync] %s: sync reference = COMMUNITY ENGLISH provider=%s id=%s "
-                        "match_kind=%s filename_score=%s release_name=%s",
-                        content_id,
-                        english_reference.get('provider_name'),
-                        english_reference.get('provider_subtitle_id'),
-                        english_reference.get('match_kind'),
-                        english_reference.get('filename_score'),
-                        english_reference.get('release_name'),
-                    )
-                else:
-                    ffsubsync_log.warning(
-                        "[ffsubsync] %s: sync reference = NONE (no embedded upload, no community English)",
-                        content_id,
-                    )
+        if preferred_lang == 'spa':
+            indexed = lookup_embedded_index(content_id, video_hash, video_size, video_filename)
+            if embedded_reference:
+                english_reference = embedded_reference
+            elif indexed:
+                english_reference = embedded_meta_to_english_reference(indexed)
 
         download_context = {
             'content_type': content_type,
@@ -425,25 +419,24 @@ async def _handle_addon_stream(user, content_type: str, content_id: str, params:
             active_subtitle_info = await get_active_subtitle_details(user, content_id, video_hash, content_type, video_filename, preferred_lang, cached_provider_results=cached_provider_results)
 
             if preferred_lang == 'spa':
-                from ..lib.ffsubsync_service import build_sync_metadata, describe_eng_reference_source, ffsubsync_skip_reason
+                from ..lib.ffsubsync_service import build_sync_metadata
                 download_context['sync'] = build_sync_metadata(active_subtitle_info, english_reference)
                 sync_meta = download_context['sync']
-                skip_reason = ffsubsync_skip_reason(sync_meta)
-                sync_plan = (
-                    f"will sync using {describe_eng_reference_source(sync_meta)}"
-                    if skip_reason is None
-                    else f"will NOT sync ({skip_reason}); eng_source={describe_eng_reference_source(sync_meta)}"
-                )
                 ffsubsync_log.info(
-                    "[ffsubsync] %s: Spanish subtitle selected provider=%s id=%s "
-                    "match_kind=%s filename_score=%s release_name=%s — %s",
+                    "[ffsubsync] %s: selected Spanish %s/%s (%s)",
                     content_id,
                     active_subtitle_info.get('provider_name'),
                     active_subtitle_info.get('provider_subtitle_id'),
-                    active_subtitle_info.get('match_kind'),
-                    active_subtitle_info.get('filename_score'),
-                    active_subtitle_info.get('release_name'),
-                    sync_plan,
+                    active_subtitle_info.get('match_kind') or "match",
+                )
+                save_listing_sidecar(
+                    content_id,
+                    video_hash,
+                    video_size,
+                    video_filename,
+                    active_subtitle_info,
+                    download_context,
+                    sync_meta,
                 )
 
             try:
@@ -531,8 +524,6 @@ async def _handle_addon_stream(user, content_type: str, content_id: str, params:
                 current_app.logger.info(f"Added ASS format subtitle for context: {download_context}")
             else:
                 entries.append(vtt_entry)
-            
-            current_app.logger.info(f"Generated download URL for context: {download_context}")
             return entries
         except Exception as e:
             current_app.logger.error(f"Error generating download URL for identifier {download_identifier}: {e}")
@@ -631,6 +622,43 @@ async def _unified_download_for_user(user, download_identifier: str):
         current_app.logger.error(f"Failed to decode download identifier '{download_identifier}': {e}")
         return NoCacheResponse(generate_vtt_message("Invalid download link."), status=400, mimetype='text/vtt')
 
+    announced_sync = context.get('sync') or {}
+    from ..lib.ffsubsync_service import lookup_playback_sync, make_sync_cache_key, read_cached_vtt
+    remembered = lookup_playback_sync(context)
+    if remembered:
+        remembered_sync = remembered['sync']
+        same_spanish = (
+            not announced_sync.get('spa_id')
+            or (
+                str(remembered_sync.get('spa_id')) == str(announced_sync.get('spa_id'))
+                and remembered_sync.get('spa_provider') == announced_sync.get('spa_provider')
+            )
+        )
+        if same_spanish:
+            cached_vtt = read_cached_vtt(remembered['cache_key'])
+            if cached_vtt:
+                ffsubsync_log.info(
+                    "[ffsubsync] %s: serving cached synced subtitle before provider download bytes=%d",
+                    content_id,
+                    len(cached_vtt.encode('utf-8')),
+                )
+                return NoCacheResponse(cached_vtt, mimetype='text/vtt')
+    if (
+        lang == 'spa'
+        and announced_sync.get('spa_provider')
+        and announced_sync.get('spa_id')
+        and announced_sync.get('eng_provider')
+        and announced_sync.get('eng_id')
+    ):
+        cached_vtt = read_cached_vtt(make_sync_cache_key(context, announced_sync))
+        if cached_vtt:
+            ffsubsync_log.info(
+                "[ffsubsync] %s: serving cached synced subtitle before provider download bytes=%d",
+                content_id,
+                len(cached_vtt.encode('utf-8')),
+            )
+            return NoCacheResponse(cached_vtt, mimetype='text/vtt')
+
     announced = context.get('sync') or {}
     announced_provider = announced.get('spa_provider')
     announced_id = announced.get('spa_id')
@@ -671,8 +699,6 @@ async def _unified_download_for_user(user, download_identifier: str):
                 'subtitle_id': subtitle_id,
                 'metadata': active_subtitle_info.get('provider_metadata', {})
             }
-            current_app.logger.info(
-                f"Serving {provider_name} subtitle {subtitle_id} (type: {active_subtitle_info['type']})")
         else:
             current_app.logger.error(f"Provider subtitle missing provider_name or subtitle_id: {active_subtitle_info}")
             provider_subtitle_to_serve = None
@@ -772,7 +798,12 @@ async def _unified_download_for_user(user, download_identifier: str):
                     message_key = 'provider_integration_inactive'
                     failed_provider_name = provider_name
                 else:
-                    current_app.logger.info(f"Attempting to serve {provider_name} subtitle: {subtitle_id}")
+                    current_app.logger.info(
+                        "[ffsubsync] %s: downloading %s/%s",
+                        content_id,
+                        provider_name,
+                        subtitle_id,
+                    )
                     try:
                         provider_subtitle_url = await provider.get_download_url(user, subtitle_id)
                         
@@ -805,8 +836,6 @@ async def _unified_download_for_user(user, download_identifier: str):
                             except Exception as e:
                                 current_app.logger.error(f"Error processing {provider_name} ZIP (subtitle_id={subtitle_id}): {e}", exc_info=True)
                                 message_key = 'error'
-                        else:
-                            current_app.logger.info(f"Got download URL from {provider_name}")
                     except ProviderDownloadError as e:
                         error_msg = str(e)
                         # Log as warning for client errors (4xx), error for server errors
@@ -854,13 +883,13 @@ async def _unified_download_for_user(user, download_identifier: str):
                         failed_provider_error = 'Provider returned HTML instead of a subtitle file'
                     else:
                         # Check if response is ZIP (SubDL URLs often end with .zip?api_key=...)
-                        content_type = r.headers.get('Content-Type', '')
+                        response_content_type = r.headers.get('Content-Type', '')
                         is_zip_response = (
                             (len(body) >= 2 and body[:2] == b'PK')
                             or body[:4] == b'Rar!'
                             or (
-                                'zip' in content_type.lower()
-                                and 'html' not in content_type.lower()
+                                'zip' in response_content_type.lower()
+                                and 'html' not in response_content_type.lower()
                             )
                         )
                         if is_zip_response:
@@ -891,10 +920,10 @@ async def _unified_download_for_user(user, download_identifier: str):
                                     current_app.logger.warning(f"Provider archive contains no subtitle files (url={provider_subtitle_url}): {e}")
                                     message_key = 'provider_no_subtitle_in_archive'
                                 else:
-                                    current_app.logger.error(f"Error processing ZIP subtitle (url={provider_subtitle_url}, content_type={content_type}, response_size={len(body)}): {e}", exc_info=True)
+                                    current_app.logger.error(f"Error processing ZIP subtitle (url={provider_subtitle_url}, content_type={response_content_type}, response_size={len(body)}): {e}", exc_info=True)
                                     message_key = 'error'
                             except Exception as e:
-                                current_app.logger.error(f"Error processing ZIP subtitle (url={provider_subtitle_url}, content_type={content_type}): {e}", exc_info=True)
+                                current_app.logger.error(f"Error processing ZIP subtitle (url={provider_subtitle_url}, content_type={response_content_type}): {e}", exc_info=True)
                                 message_key = 'error'
                         else:
                             if is_ass_request:
@@ -919,37 +948,59 @@ async def _unified_download_for_user(user, download_identifier: str):
     if vtt_content:
         sync_meta = context.get('sync') if lang == 'spa' else None
         if sync_meta:
-            from ..lib.ffsubsync_service import maybe_apply_ffsubsync, describe_eng_reference_source
-            ffsubsync_start = time.perf_counter()
-            ffsubsync_log.info(
-                "[ffsubsync] %s: download sync starting — eng_source=%s spa=%s/%s input_vtt_bytes=%d",
-                content_id,
-                describe_eng_reference_source(sync_meta),
-                sync_meta.get('spa_provider'),
-                sync_meta.get('spa_id'),
-                len(vtt_content.encode('utf-8')),
+            from ..lib.embedded_reference_index import resolve_sync_english_reference
+            from ..lib.ffsubsync_service import (
+                build_sync_metadata,
+                maybe_apply_ffsubsync,
+                describe_eng_reference_source,
             )
-            synced_vtt = await maybe_apply_ffsubsync(user, vtt_content, context, sync_meta, episode=episode)
-            ffsubsync_elapsed = time.perf_counter() - ffsubsync_start
-            if synced_vtt:
+
+            token_meta = dict(sync_meta)
+            eng_ref = resolve_sync_english_reference(
+                content_id,
+                video_hash,
+                context.get('v_size'),
+                video_filename,
+                token_meta,
+            )
+            if eng_ref is None or not eng_ref.get('provider_subtitle_id'):
+                try:
+                    eng_details = await get_active_subtitle_details(
+                        user,
+                        content_id,
+                        video_hash,
+                        content_type,
+                        video_filename,
+                        'eng',
+                        season,
+                        episode,
+                    )
+                except Exception as eng_exc:
+                    ffsubsync_log.warning(
+                        "[ffsubsync] %s: download-time English fallback search failed: %s",
+                        content_id,
+                        eng_exc,
+                    )
+                    eng_details = None
+                if eng_details and eng_details.get('type') != 'none':
+                    eng_ref = eng_details
+            if eng_ref and active_subtitle_info.get('type') != 'none':
+                sync_meta = build_sync_metadata(active_subtitle_info, eng_ref)
+                context = dict(context)
+                context['sync'] = sync_meta
                 ffsubsync_log.info(
-                    "[ffsubsync] %s: serving SYNCED Spanish (ref=%s) elapsed=%.3fs "
-                    "output_bytes=%d original_bytes=%d",
+                    "[ffsubsync] %s: English reference %s/%s",
                     content_id,
-                    describe_eng_reference_source(sync_meta),
-                    ffsubsync_elapsed,
-                    len(synced_vtt.encode('utf-8')),
-                    len(vtt_content.encode('utf-8')),
+                    sync_meta.get('eng_provider'),
+                    sync_meta.get('eng_id'),
                 )
+            synced_vtt = await maybe_apply_ffsubsync(user, vtt_content, context, sync_meta, episode=episode)
+            if synced_vtt:
                 vtt_content = synced_vtt
             else:
                 ffsubsync_log.info(
-                    "[ffsubsync] %s: serving UNSYNCED Spanish (ref=%s, sync skipped or failed) "
-                    "elapsed=%.3fs bytes=%d",
+                    "[ffsubsync] %s: serving Spanish without sync",
                     content_id,
-                    describe_eng_reference_source(sync_meta),
-                    ffsubsync_elapsed,
-                    len(vtt_content.encode('utf-8')),
                 )
         vtt_content = normalize_vtt_for_players(vtt_content)
         if not vtt_content.strip().upper().startswith("WEBVTT"):

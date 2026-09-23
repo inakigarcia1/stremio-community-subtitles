@@ -370,8 +370,6 @@ async def get_active_subtitle_details(user, content_id, video_hash=None, content
                 'subtitle': user_selection.selected_subtitle,
                 'user_vote_value': await _get_user_vote(user, user_selection.selected_subtitle_id)
             })
-            elapsed = time.time() - func_start
-            current_app.logger.debug(f"[TIMING] get_active_subtitle_details: {elapsed:.3f}s (user selection local)")
             return result
         
         # Provider selection
@@ -397,8 +395,6 @@ async def get_active_subtitle_details(user, content_id, video_hash=None, content
                     'moviehash_match': details.get('hash_match', False),
                     'url': details.get('url', '')
                 })
-                elapsed = time.time() - func_start
-                current_app.logger.debug(f"[TIMING] get_active_subtitle_details: {elapsed:.3f}s (user selection provider)")
                 return result
     
     # 2. Local by hash
@@ -413,8 +409,6 @@ async def get_active_subtitle_details(user, content_id, video_hash=None, content
                 'match_kind': 'local_hash',
                 'filename_score': None,
             })
-            elapsed = time.time() - func_start
-            current_app.logger.debug(f"[TIMING] get_active_subtitle_details: {elapsed:.3f}s (local by hash)")
             return result
     
     # 3. Providers by hash
@@ -423,8 +417,6 @@ async def get_active_subtitle_details(user, content_id, video_hash=None, content
         if provider_result:
             result.update(provider_result)
             result['auto'] = True
-            elapsed = time.time() - func_start
-            current_app.logger.debug(f"[TIMING] get_active_subtitle_details: {elapsed:.3f}s (provider by hash)")
             return result
     
     # 4. Best match by filename
@@ -433,8 +425,6 @@ async def get_active_subtitle_details(user, content_id, video_hash=None, content
         if best_match:
             result.update(best_match)
             result['auto'] = True
-            elapsed = time.time() - func_start
-            current_app.logger.debug(f"[TIMING] get_active_subtitle_details: {elapsed:.3f}s (best match by filename)")
             return result
     
     # 5. Fallback
@@ -442,12 +432,8 @@ async def get_active_subtitle_details(user, content_id, video_hash=None, content
     if fallback:
         result.update(fallback)
         result['auto'] = True
-        elapsed = time.time() - func_start
-        current_app.logger.debug(f"[TIMING] get_active_subtitle_details: {elapsed:.3f}s (fallback)")
         return result
-    
-    elapsed = time.time() - func_start
-    current_app.logger.debug(f"[TIMING] get_active_subtitle_details: {elapsed:.3f}s (no match)")
+
     return result
 
 

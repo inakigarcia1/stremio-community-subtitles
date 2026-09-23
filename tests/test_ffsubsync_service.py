@@ -149,7 +149,12 @@ def test_parse_and_reject_ep9_style_alignment():
     assert ffsubsync_service.alignment_reject_reason(alignment) is not None
 
 
-def test_accepts_ep8_style_alignment():
+def test_accepts_borderline_high_score_with_unit_scale():
+    alignment = ffsubsync_service.parse_ffsubsync_alignment(
+        "",
+        "INFO     score: 11056.396\nINFO     offset seconds: 2.01\nINFO     framerate scale factor: 1.001",
+    )
+    assert ffsubsync_service.alignment_reject_reason(alignment) is None
     alignment = ffsubsync_service.parse_ffsubsync_alignment(
         "",
         "INFO     score: 27938.426\nINFO     offset seconds: 2.060\nINFO     framerate scale factor: 1.001",
