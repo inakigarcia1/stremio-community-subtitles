@@ -1,5 +1,6 @@
 from typing import List, Optional
 from quart import current_app
+from ...languages import is_spanish_language
 from ..base import BaseSubtitleProvider, SubtitleResult, ProviderAuthError, ProviderDownloadError
 from .client import SubSourceClient
 
@@ -43,6 +44,7 @@ class SubSourceProvider(BaseSubtitleProvider):
     supports_hash_matching = False
     can_return_ass = True
     has_additional_settings = True
+    returns_zip = True
     
     async def authenticate(self, user, credentials: dict) -> dict:
         """Authenticate with SubSource API"""
@@ -110,94 +112,68 @@ class SubSourceProvider(BaseSubtitleProvider):
                     continue
                 
                 page = 1
-                max_pages = 3  # Limit to first 3 pages
-                
+                max_pages = 3
+                season_items = []
+
                 while page <= max_pages:
                     response = await client.get_subtitles(movie_id, subsource_lang, page=page, limit=20)
-                    
+
                     if not response.get('success') or not response.get('data'):
                         break
-                    
+
                     for sub in response['data']:
                         release_info = ' '.join(sub.get('releaseInfo', []))
                         commentary = sub.get('commentary', '')
-                        
-                        # Filter by episode if provided
-                        if episode:
-                            import re
-                            text_to_check = f"{release_info} {commentary}".lower()
-                            
-                            # Check for exact episode match with word boundaries
-                            episode_patterns = [
-                                rf'\bep{episode:03d}\b',  # Ep101
-                                rf'\bep{episode:02d}\b',  # Ep01
-                                rf'\bep{episode}\b',  # Ep1
-                                rf'\bepisode\s+{episode}\b',  # Episode 101
-                                rf'\b-\s*{episode:03d}\b',  # - 101
-                                rf'\b{episode:03d}\b',  # 101 (standalone)
-                                rf'\b{episode:02d}\b',  # 01 (standalone)
-                            ]
-                            
-                            exact_match = any(re.search(pattern, text_to_check) for pattern in episode_patterns)
-                            
-                            if not exact_match:
-                                # Check if it's in a range (e.g., "Ep1-100", "101-148")
-                                range_patterns = [
-                                    r'ep?(\d+)-(\d+)',  # Ep1-100, 1-100
-                                    r'(\d+)\s*-\s*(\d+)',  # "101 - 148"
-                                ]
-                                in_range = False
-                                for pattern in range_patterns:
-                                    for match in re.finditer(pattern, text_to_check):
-                                        start = int(match.group(1))
-                                        end = int(match.group(2))
-                                        if start <= episode <= end:
-                                            in_range = True
-                                            break
-                                    if in_range:
-                                        break
-                                
-                                if not in_range:
-                                    continue  # Skip this subtitle
-                        
-                        # Build uploader name
-                        uploader = None
-                        if sub.get('contributors'):
-                            uploader = sub['contributors'][0].get('displayname')
-                        
-                        # Calculate rating (good / total)
-                        rating = 0.0
-                        rating_data = sub.get('rating', {})
-                        if rating_data.get('total', 0) > 0:
-                            rating = rating_data.get('good', 0) / rating_data['total']
-                        
-                        results.append(SubtitleResult(
-                            subtitle_id=str(sub['subtitleId']),
-                            release_name=release_info or f"SubSource {sub['subtitleId']}",
-                            language=lang_code,
-                            uploader=uploader,
-                            rating=rating,
-                            download_count=sub.get('downloads', 0),
-                            hearing_impaired=sub.get('hearingImpaired', False),
-                            ai_translated=False,
-                            forced=sub.get('foreignParts', False),
-                            provider_name=self.name,
-                            metadata={
-                                'movie_id': movie_id,
-                                'files': sub.get('files', 1),
-                                'framerate': sub.get('framerate'),
-                                'production_type': sub.get('productionType'),
-                                'release_type': sub.get('releaseType'),
-                                'commentary': sub.get('commentary')
-                            }
-                        ))
-                    
-                    # Check if there are more pages
+                        season_items.append((sub, release_info, commentary))
+
                     pagination = response.get('pagination', {})
                     if page >= pagination.get('pages', 1):
                         break
-                    
                     page += 1
+
+                matched_items = season_items
+                if episode:
+                    matched_items = [
+                        item for item in season_items
+                        if self._subtitle_matches_episode(item[1], item[2], episode)
+                    ]
+                    if not matched_items and season_items and is_spanish_language(lang_code):
+                        current_app.logger.info(
+                            "SubSource episode filter dropped every Spanish subtitle for movie %s episode %s; keeping the season list",
+                            movie_id, episode,
+                        )
+                        matched_items = season_items
+
+                for sub, release_info, commentary in matched_items:
+                    uploader = None
+                    if sub.get('contributors'):
+                        uploader = sub['contributors'][0].get('displayname')
+
+                    rating = 0.0
+                    rating_data = sub.get('rating', {})
+                    if rating_data.get('total', 0) > 0:
+                        rating = rating_data.get('good', 0) / rating_data['total']
+
+                    results.append(SubtitleResult(
+                        subtitle_id=str(sub['subtitleId']),
+                        release_name=release_info or f"SubSource {sub['subtitleId']}",
+                        language=lang_code,
+                        uploader=uploader,
+                        rating=rating,
+                        download_count=sub.get('downloads', 0),
+                        hearing_impaired=sub.get('hearingImpaired', False),
+                        ai_translated=False,
+                        forced=sub.get('foreignParts', False),
+                        provider_name=self.name,
+                        metadata={
+                            'movie_id': movie_id,
+                            'files': sub.get('files', 1),
+                            'framerate': sub.get('framerate'),
+                            'production_type': sub.get('productionType'),
+                            'release_type': sub.get('releaseType'),
+                            'commentary': commentary
+                        }
+                    ))
             
             return results
             
@@ -227,6 +203,33 @@ class SubSourceProvider(BaseSubtitleProvider):
             current_app.logger.error(f"SubSource download failed: {e}")
             raise ProviderDownloadError(f"Failed to download subtitle: {str(e)}")
     
+    @staticmethod
+    def _subtitle_matches_episode(release_info: str, commentary: str, episode: int) -> bool:
+        import re
+        text_to_check = f"{release_info} {commentary}".lower()
+        episode_patterns = [
+            rf'\bep{episode:03d}\b',
+            rf'\bep{episode:02d}\b',
+            rf'\bep{episode}\b',
+            rf'\bepisode\s+{episode}\b',
+            rf'\b-\s*{episode:03d}\b',
+            rf'\b{episode:03d}\b',
+            rf'\b{episode:02d}\b',
+        ]
+        if any(re.search(pattern, text_to_check) for pattern in episode_patterns):
+            return True
+        range_patterns = [
+            r'ep?(\d+)-(\d+)',
+            r'(\d+)\s*-\s*(\d+)',
+        ]
+        for pattern in range_patterns:
+            for match in re.finditer(pattern, text_to_check):
+                start = int(match.group(1))
+                end = int(match.group(2))
+                if start <= episode <= end:
+                    return True
+        return False
+
     def get_settings_template(self) -> str:
         """Get settings template path"""
         return 'providers/subsource_form.html'

@@ -6,6 +6,7 @@ from sqlalchemy.orm import selectinload
 from ..models import Subtitle, SubtitleVote, UserSubtitleSelection
 from ..extensions import async_session_maker
 import os
+import random
 import re
 import aiohttp
 import time
@@ -206,17 +207,28 @@ def extract_release_components(name):
 def calculate_filename_similarity(video_filename, subtitle_release_name, is_forced=False):
     """
     Calculates similarity between video filename and subtitle release name.
-    
-    Priority order:
-    1. Source type proximity (exact match > similar quality tier > different tier)
-    2. Release group match (most important for sync)
-    3. Resolution match
-    4. Title similarity (least important, already filtered by content_id)
-    
-    Forced subtitles get a penalty unless user explicitly prefers them.
-    
+
+    Multi-release strings (Napisy24 joins them with ';') are scored per segment.
+    The highest segment score is the result.
+
     Returns a float between 0.0 and 1.0.
     """
+    if not video_filename or not subtitle_release_name:
+        return 0.0
+
+    if ';' in subtitle_release_name:
+        segments = [segment.strip() for segment in subtitle_release_name.split(';') if segment.strip()]
+        if len(segments) > 1:
+            return max(
+                _calculate_single_filename_similarity(video_filename, segment, is_forced)
+                for segment in segments
+            )
+
+    return _calculate_single_filename_similarity(video_filename, subtitle_release_name, is_forced)
+
+
+def _calculate_single_filename_similarity(video_filename, subtitle_release_name, is_forced=False):
+    """Score one video filename against one subtitle release name."""
     if not video_filename or not subtitle_release_name:
         return 0.0
 
@@ -304,7 +316,7 @@ def calculate_filename_similarity(video_filename, subtitle_release_name, is_forc
 
 
 
-async def get_active_subtitle_details(user, content_id, video_hash=None, content_type=None, video_filename=None, lang=None, season=None, episode=None, cached_provider_results=None):
+async def get_active_subtitle_details(user, content_id, video_hash=None, content_type=None, video_filename=None, lang=None, season=None, episode=None, cached_provider_results=None, video_size=None):
     """Provider-agnostic subtitle selection logic"""
     import time
     func_start = time.time()
@@ -421,16 +433,25 @@ async def get_active_subtitle_details(user, content_id, video_hash=None, content
     
     # 4. Best match by filename
     if video_filename:
-        best_match = await _find_best_match_by_filename(user, content_id, imdb_id, video_filename, content_type, lang, season, episode, cached_provider_results)
+        best_match = await _find_best_match_by_filename(user, content_id, imdb_id, video_filename, content_type, lang, season, episode, cached_provider_results, video_hash=video_hash)
         if best_match:
             result.update(best_match)
             result['auto'] = True
             return result
     
     # 5. Fallback
-    fallback = await _find_fallback_subtitle(user, content_id, imdb_id, content_type, lang, season, episode, cached_provider_results)
+    fallback = await _find_fallback_subtitle(user, content_id, imdb_id, content_type, lang, season, episode, cached_provider_results, video_hash=video_hash)
     if fallback:
         result.update(fallback)
+        result['auto'] = True
+        return result
+
+    stremio_match = await _opensubtitles_stremio_fallback(
+        user, imdb_id, video_filename, content_type, lang, season, episode,
+        cached_provider_results, video_hash=video_hash, video_size=video_size,
+    )
+    if stremio_match:
+        result.update(stremio_match)
         result['auto'] = True
         return result
 
@@ -520,7 +541,7 @@ async def _search_providers_by_hash(user, imdb_id, video_hash, content_type, lan
                 'type': f'{provider_name}_auto',
                 'provider_name': provider_name,
                 'provider_subtitle_id': result.subtitle_id,
-                'provider_metadata': {'release_name': result.release_name, 'uploader': result.uploader, 'hash_match': True},
+                'provider_metadata': _metadata_from_result(result, uploader=result.uploader, hash_match=True),
                 'details': {'file_id': result.subtitle_id, 'release_name': result.release_name},
                 'release_name': result.release_name,
                 'uploader': result.uploader,
@@ -581,11 +602,7 @@ async def _search_providers_by_hash(user, imdb_id, video_hash, content_type, lan
                 'type': f'{provider_name}_auto',
                 'provider_name': provider_name,
                 'provider_subtitle_id': result.subtitle_id,
-                'provider_metadata': {
-                    'release_name': result.release_name,
-                    'uploader': result.uploader,
-                    'hash_match': True
-                },
+                'provider_metadata': _metadata_from_result(result, uploader=result.uploader, hash_match=True),
                 'details': {'file_id': result.subtitle_id, 'release_name': result.release_name},
                 'release_name': result.release_name,
                 'uploader': result.uploader,
@@ -604,7 +621,103 @@ async def _search_providers_by_hash(user, imdb_id, video_hash, content_type, lan
     return None
 
 
-async def _find_best_match_by_filename(user, content_id, imdb_id, video_filename, content_type, lang, season=None, episode=None, cached_results=None):
+def _metadata_from_result(result, **extra):
+    metadata = result.metadata or {}
+    payload = {
+        'release_name': result.release_name,
+        'format': metadata.get('format'),
+        'encoding': metadata.get('encoding'),
+    }
+    payload.update(extra)
+    return payload
+
+
+def _ass_score_bonus(user, metadata_or_source, from_local=False):
+    if not getattr(user, 'prioritize_ass_subtitles', False):
+        return 0.0
+    if from_local:
+        source = metadata_or_source or {}
+        original = source.get('original_format')
+    else:
+        source = metadata_or_source or {}
+        original = source.get('format')
+    if original in ('ass', 'ssa'):
+        return 0.15
+    return 0.0
+
+
+def _choose_best_scored(candidates, prioritize_forced=False):
+    """Prefer score > 0. If every score is at or below 0, keep the least bad one."""
+    if not candidates:
+        return None
+    positive = [candidate for candidate in candidates if candidate['score'] > 0]
+    pool = positive or candidates
+    if prioritize_forced:
+        def sort_key(candidate):
+            return (not candidate.get('forced', False), -candidate['score'])
+        best_key = min(sort_key(candidate) for candidate in pool)
+        tied = [candidate for candidate in pool if sort_key(candidate) == best_key]
+    else:
+        best_score = max(candidate['score'] for candidate in pool)
+        tied = [candidate for candidate in pool if candidate['score'] == best_score]
+    return random.choice(tied)
+
+
+async def _opensubtitles_stremio_fallback(user, imdb_id, video_filename, content_type, lang, season, episode, cached_results, video_hash=None, video_size=None):
+    from ..languages import is_spanish_language
+    from ..providers.opensubtitles_stremio.provider import primary_providers_returned_spanish
+    from ..providers.registry import ProviderRegistry
+
+    if not is_spanish_language(lang):
+        return None
+    if primary_providers_returned_spanish(cached_results):
+        return None
+    if not imdb_id:
+        return None
+
+    provider = ProviderRegistry.get('opensubtitles_stremio')
+    if not provider:
+        return None
+    try:
+        results = await provider.search(
+            user=user,
+            imdb_id=imdb_id,
+            languages=[lang],
+            video_hash=video_hash,
+            video_size=video_size,
+            season=season,
+            episode=episode,
+            content_type=content_type,
+            video_filename=video_filename,
+        )
+    except Exception as exc:
+        current_app.logger.warning("OpenSubtitles Stremio fallback failed: %s", exc)
+        return None
+    if not results:
+        return None
+    chosen = results[0]
+    metadata = chosen.metadata or {}
+    return {
+        'type': 'opensubtitles_stremio_auto',
+        'provider_name': provider.name,
+        'provider_subtitle_id': chosen.subtitle_id,
+        'provider_metadata': _metadata_from_result(chosen, url=metadata.get('url', '')),
+        'details': {'file_id': chosen.subtitle_id},
+        'release_name': chosen.release_name,
+        'uploader': chosen.uploader,
+        'rating': chosen.rating,
+        'download_count': chosen.download_count,
+        'hearing_impaired': chosen.hearing_impaired,
+        'ai_translated': chosen.ai_translated,
+        'forced': chosen.forced,
+        'moviehash_match': False,
+        'url': metadata.get('url', ''),
+        'match_kind': 'opensubtitles_stremio',
+        'filename_score': metadata.get('filename_score'),
+    }
+
+
+async def _find_best_match_by_filename(user, content_id, imdb_id, video_filename, content_type, lang, season=None, episode=None, cached_results=None, video_hash=None):
     """Find best match by filename from cache or live search"""
     candidates = []
     
@@ -618,8 +731,8 @@ async def _find_best_match_by_filename(user, content_id, imdb_id, video_filename
     for sub in local_subs:
         is_sub_forced = getattr(sub, 'forced', False) or (sub.version_info and 'forced' in sub.version_info.lower())
         score = calculate_filename_similarity(video_filename, sub.version_info, is_forced=is_sub_forced)
-        if score > 0:
-            candidates.append({'type': 'local', 'subtitle': sub, 'score': score, 'forced': is_sub_forced})
+        score += _ass_score_bonus(user, sub.source_metadata, from_local=True)
+        candidates.append({'type': 'local', 'subtitle': sub, 'score': score, 'forced': is_sub_forced})
     
     # Providers (cached or live)
     if cached_results:
@@ -630,12 +743,12 @@ async def _find_best_match_by_filename(user, content_id, imdb_id, video_filename
                     score = calculate_filename_similarity(video_filename, result.release_name, is_forced=is_result_forced)
                     if result.ai_translated:
                         score -= 0.05
-                    if score > 0:
-                        candidates.append({
+                    score += _ass_score_bonus(user, result.metadata)
+                    candidates.append({
                             'type': 'provider',
                             'provider_name': provider_name,
                             'provider_subtitle_id': result.subtitle_id,
-                            'provider_metadata': {'release_name': result.release_name},
+                            'provider_metadata': _metadata_from_result(result),
                             'score': score,
                             'release_name': result.release_name,
                             'uploader': result.uploader,
@@ -656,6 +769,7 @@ async def _find_best_match_by_filename(user, content_id, imdb_id, video_filename
             search_params = {
                 'imdb_id': imdb_id,
                 'content_id': content_id,
+                'video_hash': video_hash,
                 'languages': [lang],
                 'season': season,
                 'episode': episode,
@@ -671,12 +785,12 @@ async def _find_best_match_by_filename(user, content_id, imdb_id, video_filename
                     score = calculate_filename_similarity(video_filename, result.release_name, is_forced=is_result_forced)
                     if result.ai_translated:
                         score -= 0.05
-                    if score > 0:
-                        candidates.append({
+                    score += _ass_score_bonus(user, result.metadata)
+                    candidates.append({
                             'type': 'provider',
                             'provider_name': provider_name,
                             'provider_subtitle_id': result.subtitle_id,
-                            'provider_metadata': {'release_name': result.release_name},
+                            'provider_metadata': _metadata_from_result(result),
                             'score': score,
                             'release_name': result.release_name,
                             'uploader': result.uploader,
@@ -691,15 +805,9 @@ async def _find_best_match_by_filename(user, content_id, imdb_id, video_filename
         except:
             pass
     
-    if not candidates:
+    best = _choose_best_scored(candidates, prioritize_forced=bool(getattr(user, 'prioritize_forced_subtitles', False)))
+    if not best:
         return None
-    
-    if user.prioritize_forced_subtitles:
-        candidates.sort(key=lambda c: (not c.get('forced', False), -c['score']))
-    else:
-        candidates.sort(key=lambda c: c['score'], reverse=True)
-    
-    best = candidates[0]
     
     if best['type'] == 'local':
         return {
@@ -730,7 +838,7 @@ async def _find_best_match_by_filename(user, content_id, imdb_id, video_filename
         }
 
 
-async def _find_fallback_subtitle(user, content_id, imdb_id, content_type, lang, season=None, episode=None, cached_results=None):
+async def _find_fallback_subtitle(user, content_id, imdb_id, content_type, lang, season=None, episode=None, cached_results=None, video_hash=None):
     """Find fallback subtitle from cache or live search"""
     # Local first
     async with async_session_maker() as session:
@@ -763,6 +871,7 @@ async def _find_fallback_subtitle(user, content_id, imdb_id, content_type, lang,
             search_params = {
                 'imdb_id': imdb_id,
                 'content_id': content_id,
+                'video_hash': video_hash,
                 'languages': [lang],
                 'season': season,
                 'episode': episode,
@@ -778,7 +887,10 @@ async def _find_fallback_subtitle(user, content_id, imdb_id, content_type, lang,
     for provider_name, lang_results in results_by_provider.items():
         if not lang_results:
             continue
-        
+
+        if getattr(user, 'prioritize_ass_subtitles', False):
+            lang_results.sort(key=lambda item: (item.metadata or {}).get('format') not in ('ass', 'ssa'))
+
         if episode:
             matching = []
             matching_ep_only = []
@@ -835,7 +947,7 @@ async def _find_fallback_subtitle(user, content_id, imdb_id, content_type, lang,
                 'type': f'{provider_name}_auto',
                 'provider_name': provider_name,
                 'provider_subtitle_id': chosen.subtitle_id,
-                'provider_metadata': {'release_name': chosen.release_name},
+                'provider_metadata': _metadata_from_result(chosen),
                 'details': {'file_id': chosen.subtitle_id},
                 'release_name': chosen.release_name,
                 'uploader': chosen.uploader,
@@ -904,10 +1016,11 @@ def looks_like_html_payload(payload: bytes) -> bool:
     )
 
 
-def extract_subtitle_from_zip(zip_content: bytes, episode: int = None):
+def extract_subtitle_from_zip(zip_content: bytes, episode: int = None, video_filename: str = None):
     """
     Extracts subtitle file from ZIP or RAR archive.
     If episode is provided, tries to find file matching episode number.
+    If video_filename is provided and several files remain, pick the closest release name.
     Returns tuple: (subtitle_content: bytes, filename: str, extension: str)
     """
     if looks_like_html_payload(zip_content):
@@ -978,7 +1091,25 @@ def extract_subtitle_from_zip(zip_content: bytes, episode: int = None):
                 match = re.search(r'[\s_\-.](\d+)$', name_without_ext)
                 if match and int(match.group(1)) == episode:
                     return (read_func(f), fname, os.path.splitext(fname)[1].lower())
-        
+
+        if video_filename and len(subtitle_files) > 1:
+            best_score = 0.0
+            best_file = None
+            for f in subtitle_files:
+                fname = f if isinstance(f, str) else f.filename
+                fname_base = os.path.basename(fname)
+                full_path = fname.replace('/', ' ').replace('\\', ' ')
+                score = max(
+                    calculate_filename_similarity(video_filename, fname_base),
+                    calculate_filename_similarity(video_filename, full_path),
+                )
+                if score > best_score:
+                    best_score = score
+                    best_file = f
+            if best_file and best_score > 0.05:
+                fname = best_file if isinstance(best_file, str) else best_file.filename
+                return (read_func(best_file), fname, os.path.splitext(fname)[1].lower())
+
         chosen = subtitle_files[0]
         fname = chosen if isinstance(chosen, str) else chosen.filename
         return (read_func(chosen), fname, os.path.splitext(fname)[1].lower())

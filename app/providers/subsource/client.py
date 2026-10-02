@@ -6,6 +6,17 @@ from ...version import USER_AGENT
 
 class SubSourceClient:
     BASE_URL = "https://api.subsource.net/api/v1"
+
+    @staticmethod
+    def _season_matches(item: Dict, season: int) -> bool:
+        for key in ('season', 'seasonNumber', 'season_number'):
+            if key not in item or item.get(key) in (None, ''):
+                continue
+            try:
+                return int(item.get(key)) == int(season)
+            except (TypeError, ValueError):
+                return False
+        return False
     
     def __init__(self, api_key: str):
         self.api_key = api_key
@@ -45,7 +56,19 @@ class SubSourceClient:
                 response.raise_for_status()
                 data = await response.json()
                 if data.get('success') and data.get('data'):
-                    return data['data'][0]  # Return first match
+                    match = data['data'][0]
+                    if season is not None and not self._season_matches(match, season):
+                        current_app.logger.info(
+                            "SubSource season %s did not match %s; retrying without season",
+                            season, match.get('season', match.get('seasonNumber')),
+                        )
+                        return await self.search_movie(
+                            imdb_id=imdb_id,
+                            query=query,
+                            season=None,
+                            content_type=content_type,
+                        )
+                    return match
                 return None
     
     async def get_subtitles(self, movie_id: int, language: str = None, page: int = 1, limit: int = 20) -> Dict:

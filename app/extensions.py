@@ -68,8 +68,13 @@ import json
 import time as _time
 
 class AsyncCache:
+    # Drop expired L1 entries on this many writes, and cap how many keys stay in memory.
+    L1_MAX_SIZE = 2000
+    _CLEANUP_INTERVAL = 100
+
     def __init__(self):
         self._cache = {}  # key -> (value, expires_at)
+        self._set_counter = 0
     
     async def get(self, key):
         entry = self._cache.get(key)
@@ -82,8 +87,30 @@ class AsyncCache:
         return value
     
     async def set(self, key, value, timeout=None):
+        self._set_counter += 1
+        if self._set_counter >= self._CLEANUP_INTERVAL:
+            self._set_counter = 0
+            self._evict_expired()
+
         expires_at = (_time.monotonic() + timeout) if timeout else None
         self._cache[key] = (value, expires_at)
+
+        overflow = len(self._cache) - self.L1_MAX_SIZE
+        if overflow > 0:
+            self._evict_oldest(overflow)
+
+    def _evict_expired(self):
+        now = _time.monotonic()
+        expired = [key for key, (_, expires_at) in self._cache.items() if expires_at and now > expires_at]
+        for key in expired:
+            del self._cache[key]
+
+    def _evict_oldest(self, count):
+        if count <= 0:
+            return
+        oldest = sorted(self._cache.keys(), key=lambda key: self._cache[key][1] or 0)
+        for key in oldest[:count]:
+            del self._cache[key]
     
     async def delete(self, key):
         self._cache.pop(key, None)

@@ -10,7 +10,7 @@ import aiohttp
 from quart_babel import gettext as _
 from quart import Blueprint, url_for, Response, request, current_app, flash, redirect, render_template, jsonify
 from quart_auth import current_user, login_required
-from sqlalchemy import select, delete as sql_delete, func
+from sqlalchemy import select, delete as sql_delete, func, text
 from sqlalchemy.orm import Session, joinedload
 from iso639 import Lang
 
@@ -39,6 +39,47 @@ import hashlib
 import aiofiles
 
 subtitles_bp = Blueprint('subtitles', __name__)
+
+
+def _decode_subtitle_text(raw_bytes, provider_subtitle, context):
+    """Decode provider bytes. SubEncoding wins over assuming UTF-8."""
+    from ..lib.subtitles import detect_encoding
+    meta = (provider_subtitle or {}).get('metadata') or {}
+    hint = meta.get('encoding') or (context or {}).get('sub_encoding')
+    if hint:
+        try:
+            return raw_bytes.decode(hint, errors='replace')
+        except LookupError:
+            current_app.logger.warning("Unknown subtitle encoding %s", hint)
+    encoding = detect_encoding(raw_bytes)
+    return raw_bytes.decode(encoding or 'utf-8', errors='replace')
+
+
+async def _prune_user_activities(session, user_id):
+    """Keep the newest MAX_USER_ACTIVITIES rows. MariaDB rejects LIMIT inside NOT IN."""
+    max_activities = current_app.config.get('MAX_USER_ACTIVITIES', 15)
+    old_ids_result = await session.execute(
+        text("""
+            SELECT a.id FROM user_activity a
+            LEFT JOIN (
+                SELECT id FROM user_activity
+                WHERE user_id = :uid
+                ORDER BY timestamp DESC
+                LIMIT :keep
+            ) AS kept ON a.id = kept.id
+            WHERE a.user_id = :uid2 AND kept.id IS NULL
+        """),
+        {'uid': user_id, 'uid2': user_id, 'keep': max_activities},
+    )
+    old_ids = [row[0] for row in old_ids_result.fetchall()]
+    if not old_ids:
+        return
+    placeholders = ','.join(f':id{i}' for i in range(len(old_ids)))
+    params = {f'id{i}': str(oid) for i, oid in enumerate(old_ids)}
+    await session.execute(
+        text(f"DELETE FROM user_activity WHERE id IN ({placeholders})"),
+        params,
+    )
 
 EMBEDDED_REFERENCE_FORM_FIELD = 'reference'
 
@@ -280,30 +321,8 @@ async def _handle_addon_stream(user, content_type: str, content_id: str, params:
                     )
                     session.add(new_activity)
 
-                max_activities = current_app.config.get('MAX_USER_ACTIVITIES', 15)+1
-
-                count_result = await session.execute(
-                    select(func.count()).select_from(UserActivity).filter_by(user_id=user.id)
-                )
-                current_persisted_count = count_result.scalar()
-                effective_count_after_commit = current_persisted_count
-                if not activity_found_and_updated:
-                    effective_count_after_commit += 1
-
-                if effective_count_after_commit > max_activities:
-                    num_to_delete = effective_count_after_commit - max_activities
-                    if num_to_delete > 0:
-                        oldest_ids_result = await session.execute(
-                            select(UserActivity.id).filter_by(user_id=user.id).order_by(
-                                UserActivity.timestamp.asc()).limit(num_to_delete)
-                        )
-                        oldest_ids = [row[0] for row in oldest_ids_result.all()]
-                        if oldest_ids:
-                            from sqlalchemy import delete
-                            await session.execute(
-                                delete(UserActivity).where(UserActivity.id.in_(oldest_ids))
-                            )
-
+                await session.flush()
+                await _prune_user_activities(session, user.id)
                 await session.commit()
             except Exception as e:
                 await session.rollback()
@@ -416,7 +435,14 @@ async def _handle_addon_stream(user, content_type: str, content_id: str, params:
         }
 
         try:
-            active_subtitle_info = await get_active_subtitle_details(user, content_id, video_hash, content_type, video_filename, preferred_lang, cached_provider_results=cached_provider_results)
+            active_subtitle_info = await get_active_subtitle_details(
+                user, content_id, video_hash, content_type, video_filename, preferred_lang,
+                cached_provider_results=cached_provider_results, video_size=video_size,
+            )
+
+            provider_meta = active_subtitle_info.get('provider_metadata') or {}
+            if provider_meta.get('encoding'):
+                download_context['sub_encoding'] = provider_meta.get('encoding')
 
             if preferred_lang == 'spa':
                 from ..lib.ffsubsync_service import build_sync_metadata
@@ -489,24 +515,35 @@ async def _handle_addon_stream(user, content_type: str, content_id: str, params:
             
             entries = []
             add_ass_format = False
+            ass_only = False
             
             if active_subtitle_info['type'] == 'local' and active_subtitle_info['subtitle']:
                 active_sub = active_subtitle_info['subtitle']
                 if active_sub.source_metadata and active_sub.source_metadata.get('original_format') in ['ass', 'ssa']:
                     add_ass_format = True
             else:
-                # Provider subtitle - check if the active provider supports ASS
                 provider_name = active_subtitle_info.get('provider_name')
                 if provider_name:
-                    try:
-                        from ..providers.registry import ProviderRegistry
-                        provider = ProviderRegistry.get(provider_name)
-                        if provider and provider.can_return_ass:
-                            provider_config = (user.provider_credentials or {}).get(provider_name, {})
-                            if provider_config.get('try_provide_ass', False):
-                                add_ass_format = True
-                    except:
-                        pass
+                    prov_meta = active_subtitle_info.get('provider_metadata') or {}
+                    if prov_meta.get('format') in ['ass', 'ssa']:
+                        add_ass_format = True
+                        try:
+                            from ..providers.registry import ProviderRegistry
+                            provider = ProviderRegistry.get(provider_name)
+                            if provider and not provider.returns_zip:
+                                ass_only = True
+                        except Exception:
+                            pass
+                    else:
+                        try:
+                            from ..providers.registry import ProviderRegistry
+                            provider = ProviderRegistry.get(provider_name)
+                            if provider and provider.can_return_ass:
+                                provider_config = (user.provider_credentials or {}).get(provider_name, {})
+                                if provider_config.get('try_provide_ass', False):
+                                    add_ass_format = True
+                        except Exception:
+                            pass
             
             if add_ass_format:
                 ass_download_url = download_url.replace('.vtt', '.ass')
@@ -515,7 +552,9 @@ async def _handle_addon_stream(user, content_type: str, content_id: str, params:
                     'url': ass_download_url,
                     'lang': preferred_lang
                 }
-                if user.prioritize_ass_subtitles:
+                if ass_only:
+                    entries.append(ass_entry)
+                elif user.prioritize_ass_subtitles:
                     entries.append(ass_entry)
                     entries.append(vtt_entry)
                 else:
@@ -674,7 +713,8 @@ async def _unified_download_for_user(user, download_identifier: str):
         }
     else:
         active_subtitle_info = await get_active_subtitle_details(
-            user, content_id, video_hash, content_type, video_filename, lang, season, episode
+            user, content_id, video_hash, content_type, video_filename, lang, season, episode,
+            video_size=context.get('v_size'),
         )
 
     local_subtitle_to_serve = None
@@ -814,7 +854,9 @@ async def _unified_download_for_user(user, download_identifier: str):
                                 zip_content = await provider.download_subtitle(user, subtitle_id)
                                 from .utils import extract_subtitle_from_zip, process_subtitle_content
                                 
-                                subtitle_content, filename, extension = extract_subtitle_from_zip(zip_content, episode=episode)
+                                subtitle_content, filename, extension = extract_subtitle_from_zip(
+                                    zip_content, episode=episode, video_filename=video_filename
+                                )
                                 del zip_content  # Free memory immediately
                                 
                                 processed = await process_subtitle_content(subtitle_content, extension)
@@ -901,7 +943,9 @@ async def _unified_download_for_user(user, download_identifier: str):
                                     f"size={len(zip_data)}, "
                                     f"first_bytes={zip_data[:20].hex() if len(zip_data) >= 20 else zip_data.hex()}"
                                 )
-                                subtitle_content, filename, extension = extract_subtitle_from_zip(zip_data, episode=episode)
+                                subtitle_content, filename, extension = extract_subtitle_from_zip(
+                                    zip_data, episode=episode, video_filename=video_filename
+                                )
                                 del zip_data
 
                                 processed = await process_subtitle_content(subtitle_content, extension)
@@ -930,7 +974,7 @@ async def _unified_download_for_user(user, download_identifier: str):
                                 current_app.logger.info(
                                     "ASS requested but provider returned plain text, serving as VTT"
                                 )
-                            vtt_content = body.decode('utf-8', errors='replace')
+                            vtt_content = _decode_subtitle_text(body, provider_subtitle_to_serve, context)
         except asyncio.TimeoutError:
             current_app.logger.warning(f"Timeout fetching subtitle from {provider_subtitle_url}")
             message_key = 'provider_timeout'
@@ -1978,6 +2022,72 @@ async def delete_subtitle(subtitle_id):
     if activity_id: 
         return redirect(url_for('content.content_detail', activity_id=activity_id))
     return redirect(url_for('subtitles.my_subtitles'))
+
+
+@subtitles_bp.route('/download_provider/<provider_name>/<subtitle_id>')
+@login_required
+async def download_provider_subtitle(provider_name, subtitle_id):
+    """Download a provider subtitle. SubDL ids are base64 because they are full URLs."""
+    from ..lib.subtitle_id_codec import decode_subtitle_id
+    from ..providers.registry import ProviderRegistry
+    from ..providers.base import ProviderDownloadError
+
+    subtitle_id = decode_subtitle_id(subtitle_id)
+
+    try:
+        provider = ProviderRegistry.get(provider_name)
+        if not provider:
+            await flash(_('Provider not found.'), 'danger')
+            return redirect(request.referrer or url_for('main.dashboard'))
+
+        async with async_session_maker() as session:
+            user_result = await session.execute(select(User).filter_by(id=int(current_user.auth_id)))
+            user = user_result.scalar_one_or_none()
+
+        if not user or not await provider.is_authenticated(user):
+            await flash(_('%(provider)s is not connected. Please connect in account settings.', provider=provider.display_name), 'warning')
+            return redirect(request.referrer or url_for('main.dashboard'))
+
+        try:
+            download_url = await provider.get_download_url(user, subtitle_id)
+
+            if download_url is None:
+                zip_content = await provider.download_subtitle(user, subtitle_id)
+                from .utils import extract_subtitle_from_zip
+                subtitle_content, filename, _extension = extract_subtitle_from_zip(zip_content)
+                del zip_content
+                return Response(
+                    subtitle_content,
+                    mimetype='application/octet-stream',
+                    headers={'Content-Disposition': f'attachment; filename="{filename}"'}
+                )
+
+            if provider.returns_zip:
+                async with aiohttp.ClientSession() as http_session:
+                    async with http_session.get(download_url, timeout=aiohttp.ClientTimeout(total=15)) as r:
+                        r.raise_for_status()
+                        zip_content = await r.read()
+                from .utils import extract_subtitle_from_zip
+                subtitle_content, filename, _extension = extract_subtitle_from_zip(zip_content)
+                del zip_content
+                return Response(
+                    subtitle_content,
+                    mimetype='application/octet-stream',
+                    headers={'Content-Disposition': f'attachment; filename="{filename}"'}
+                )
+
+            return no_cache_redirect(download_url, code=302)
+        except ProviderDownloadError as e:
+            current_app.logger.warning(f"Provider download error: {e}")
+            await flash(_('Error downloading from %(provider)s: %(error)s', provider=provider.display_name, error=str(e)), 'danger')
+        except Exception as e:
+            current_app.logger.error(f"Error downloading provider subtitle: {e}", exc_info=True)
+            await flash(_('Error downloading subtitle.'), 'danger')
+    except Exception as e:
+        current_app.logger.error(f"Provider download error: {e}", exc_info=True)
+        await flash(_('Error downloading subtitle.'), 'danger')
+
+    return redirect(request.referrer or url_for('main.dashboard'))
 
 
 @subtitles_bp.route('/download_subtitle/<uuid:subtitle_id>')

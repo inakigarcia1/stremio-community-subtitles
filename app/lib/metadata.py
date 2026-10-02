@@ -11,6 +11,16 @@ from ..extensions import cache
 tmdb_api = themoviedb.tmdb.TMDb()
 
 
+def _tmdb_episode_not_found(exc):
+    status = getattr(exc, 'status_code', None)
+    response = getattr(exc, 'response', None)
+    if response is not None:
+        status = status or getattr(response, 'status_code', None)
+    if status == 404:
+        return True
+    return '404' in str(exc)
+
+
 def _get_tmdb_metadata(content_id, content_type):
     """
     Fetches metadata from TMDB based on IMDb ID extracted from content_id.
@@ -93,6 +103,8 @@ def _get_tmdb_metadata(content_id, content_type):
                     if episode_title:
                         metadata['title'] = f"{metadata['title']} S{season_num:02d}E{episode_num:02d} - {episode_title}"
                 except Exception as ep_e:
+                    if _tmdb_episode_not_found(ep_e):
+                        metadata['tmdb_episode_missing'] = True
                     current_app.logger.warning(
                         f"Could not fetch TMDB episode info for {imdb_id} S{season_num}E{episode_num}: {ep_e}")
 

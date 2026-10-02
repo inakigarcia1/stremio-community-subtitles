@@ -6,6 +6,7 @@ import secrets
 
 from sqlalchemy import insert, select
 from sqlalchemy.orm import selectinload
+from sqlalchemy.orm.attributes import flag_modified
 
 from app import create_app
 from app.models import User, Role, roles_users
@@ -90,6 +91,7 @@ async def bootstrap():
             creds["opensubtitles"] = {"api_key": os_api_key}
 
         user.provider_credentials = creds
+        flag_modified(user, "provider_credentials")
 
         role_result = await session.execute(select(Role).filter_by(name="User"))
         role = role_result.scalar_one_or_none()
@@ -103,6 +105,14 @@ async def bootstrap():
                 )
 
         await session.commit()
+        await session.refresh(user)
+        if subsource_key:
+            saved = (user.provider_credentials or {}).get("subsource") or {}
+            if not (saved.get("active") and saved.get("api_key")):
+                raise RuntimeError(
+                    "SUBSOURCE_API_KEY is set but provider_credentials.subsource "
+                    "was not saved with active and api_key"
+                )
         print(f"Service user '{SERVICE_USERNAME}' ready (manifest_token={user.manifest_token})")
 
 
