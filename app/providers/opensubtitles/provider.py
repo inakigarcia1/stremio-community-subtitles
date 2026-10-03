@@ -1,4 +1,5 @@
 """OpenSubtitles provider implementation"""
+import os
 from typing import List, Dict, Optional, Any
 from quart import current_app
 from iso639 import Lang
@@ -159,6 +160,82 @@ class OpenSubtitlesProvider(BaseSubtitleProvider):
             current_app.logger.info(f"OpenSubtitles token refreshed successfully for user {user.id}")
         except opensubtitles_client.OpenSubtitlesError as e:
             raise ProviderAuthError(f"Token refresh failed: {str(e)}", self.name, getattr(e, 'status_code', None))
+
+    def _credentials_for_406_relogin(self, creds: Dict[str, Any]):
+        """Login pair for a dead bearer on download.
+
+        Production keeps the account in OPENSUBTITLES_USERNAME / OPENSUBTITLES_PASSWORD.
+        Use those when they belong to this user. Any other account keeps its stored pair,
+        which is what 401/403 refresh already does.
+        """
+        env_username = (os.environ.get("OPENSUBTITLES_USERNAME") or "").strip()
+        env_password = (os.environ.get("OPENSUBTITLES_PASSWORD") or "").strip()
+        stored_username = (creds.get("username") or "").strip()
+        stored_password = creds.get("password") or ""
+        if isinstance(stored_password, str):
+            stored_password = stored_password.strip()
+
+        if env_username and env_password and (not stored_username or stored_username == env_username):
+            return env_username, env_password
+        return stored_username, stored_password
+
+    async def _relogin_after_406(self, user, creds: Dict[str, Any]) -> None:
+        """Drop the bearer that OpenSubtitles rejected and log in once."""
+        username, password = self._credentials_for_406_relogin(creds)
+        if not username or not password:
+            raise ProviderAuthError("Missing credentials for OpenSubtitles re-login", self.name)
+
+        previous_token = creds.get("token")
+        previous_username = creds.get("username")
+        previous_password = creds.get("password")
+        creds["username"] = username
+        creds["password"] = password
+        creds["token"] = None
+        await self.save_credentials(user, creds)
+
+        try:
+            await self._refresh_token(user, creds)
+        except Exception:
+            creds["token"] = previous_token
+            creds["username"] = previous_username
+            creds["password"] = previous_password
+            await self.save_credentials(user, creds)
+            raise
+
+        await self._persist_provider_credentials(user)
+
+    async def _persist_provider_credentials(self, user) -> None:
+        """Store the new bearer. Download runs after the user session is already closed."""
+        user_id = getattr(user, "id", None)
+        if user_id is None:
+            return
+        try:
+            from ...extensions import async_session_maker
+        except Exception:
+            return
+        if async_session_maker is None:
+            return
+        try:
+            from sqlalchemy import select
+            from sqlalchemy.orm.attributes import flag_modified
+            from ...models import User
+
+            async with async_session_maker() as session:
+                result = await session.execute(select(User).filter_by(id=user_id))
+                db_user = result.scalar_one_or_none()
+                if db_user is None:
+                    return
+                current = dict(db_user.provider_credentials or {})
+                updated = dict(user.provider_credentials or {})
+                current[self.name] = updated.get(self.name)
+                db_user.provider_credentials = current
+                flag_modified(db_user, "provider_credentials")
+                await session.commit()
+        except Exception as exc:
+            current_app.logger.warning(
+                "OpenSubtitles credential update was not saved (%s)",
+                type(exc).__name__,
+            )
     
     async def search(
         self,
@@ -251,8 +328,9 @@ class OpenSubtitlesProvider(BaseSubtitleProvider):
             result = await opensubtitles_client.request_download_link(int(subtitle_id), temp_user)
             return result.get('link')
         except opensubtitles_client.OpenSubtitlesError as e:
+            status_code = getattr(e, 'status_code', None)
             # If auth error, try to refresh token and retry once
-            if getattr(e, 'status_code', None) in (401, 403):
+            if status_code in (401, 403):
                 current_app.logger.info(f"OpenSubtitles auth error during download, attempting token refresh...")
                 try:
                     await self._refresh_token(user, creds)
@@ -262,7 +340,22 @@ class OpenSubtitlesProvider(BaseSubtitleProvider):
                     return result.get('link')
                 except Exception as refresh_error:
                     current_app.logger.error(f"Token refresh failed: {refresh_error}")
-            raise ProviderDownloadError(str(e), self.name, getattr(e, 'status_code', None))
+            elif status_code == 406:
+                # 406 on /download is how a dead bearer shows up. Log in once and retry once.
+                current_app.logger.info(
+                    "OpenSubtitles download returned 406; discarding the stored bearer and logging in again"
+                )
+                try:
+                    await self._relogin_after_406(user, creds)
+                    temp_user = TempUser(creds['token'], creds['base_url'])
+                    result = await opensubtitles_client.request_download_link(int(subtitle_id), temp_user)
+                    return result.get('link')
+                except Exception as refresh_error:
+                    current_app.logger.error(
+                        "OpenSubtitles download failed again after re-login: %s",
+                        refresh_error,
+                    )
+            raise ProviderDownloadError(str(e), self.name, status_code)
     
     def get_settings_template(self) -> str:
         """Get settings template path"""

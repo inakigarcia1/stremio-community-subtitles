@@ -1,4 +1,6 @@
 import asyncio
+import os
+import re
 import aiohttp
 import time
 from quart import current_app
@@ -36,6 +38,45 @@ def _get_api_key():
     if not api_key:
         raise ValueError("OPENSUBTITLES_API_KEY not found in configuration")
     return api_key
+
+
+_JSON_SECRET_RE = re.compile(
+    r'(?i)("(?:token|api[_-]?key|password|authorization|access_token)"\s*:\s*")(.*?)(")'
+)
+_ASSIGNMENT_SECRET_RE = re.compile(
+    r'(?i)\b(password|api[_-]?key|authorization|token)\b(\s*[=:]\s*)(\S+)'
+)
+_BEARER_RE = re.compile(r'(?i)\bBearer\s+[A-Za-z0-9\-._~+/=]+')
+
+
+def redact_sensitive_text(text, secrets=None):
+    """Remove bearer tokens, API keys, Authorization values, and passwords from text."""
+    if not text:
+        return ""
+
+    redacted = text
+    unique_secrets = []
+    for secret in secrets or ():
+        if not isinstance(secret, str):
+            continue
+        secret = secret.strip()
+        if len(secret) < 8 or secret in unique_secrets:
+            continue
+        unique_secrets.append(secret)
+    for secret in sorted(unique_secrets, key=len, reverse=True):
+        redacted = redacted.replace(secret, "[REDACTED]")
+
+    redacted = _BEARER_RE.sub("Bearer [REDACTED]", redacted)
+    redacted = _JSON_SECRET_RE.sub(r"\1[REDACTED]\3", redacted)
+    redacted = _ASSIGNMENT_SECRET_RE.sub(r"\1\2[REDACTED]", redacted)
+    return redacted
+
+
+def _secrets_for_log(*values):
+    secrets = list(values)
+    secrets.append(os.environ.get("OPENSUBTITLES_PASSWORD"))
+    secrets.append(os.environ.get("OPENSUBTITLES_API_KEY"))
+    return secrets
 
 
 class OpenSubtitlesError(Exception):
@@ -342,6 +383,30 @@ async def request_download_link(file_id, user=None):
     async def make_request():
         async with aiohttp.ClientSession() as session:
             async with session.post(f"https://{user.opensubtitles_base_url}/api/v1/download", headers=headers, json=payload, timeout=aiohttp.ClientTimeout(total=15)) as response:
+                # OpenSubtitles sometimes answers 406, not 401, when the bearer is dead.
+                if response.status == 406:
+                    body = ""
+                    try:
+                        body = await response.text()
+                    except Exception as read_error:
+                        current_app.logger.warning(
+                            "OpenSubtitles download returned HTTP 406 for file_id=%s "
+                            "but the response body could not be read (%s)",
+                            file_id,
+                            type(read_error).__name__,
+                        )
+                    else:
+                        redacted = redact_sensitive_text(
+                            body,
+                            _secrets_for_log(getattr(user, "opensubtitles_token", None), api_key),
+                        )
+                        if len(redacted) > 2000:
+                            redacted = redacted[:2000] + "...[truncated]"
+                        current_app.logger.warning(
+                            "OpenSubtitles download returned HTTP 406 for file_id=%s. Response body: %s",
+                            file_id,
+                            redacted or "<empty>",
+                        )
                 response.raise_for_status()
                 return await response.json()
 
