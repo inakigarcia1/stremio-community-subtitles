@@ -35,6 +35,9 @@ class BaseSubtitleProvider(ABC):
     can_return_ass: bool = False
     has_additional_settings: bool = False
     supported_languages: List[str] = None
+    returns_zip: bool = False
+    include_in_parallel_search: bool = True
+    listed_in_settings: bool = True
     
     def __init__(self):
         if not self.name or not self.display_name:

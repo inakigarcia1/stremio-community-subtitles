@@ -140,7 +140,15 @@ def create_app():
 
     # Register custom Jinja filters
     from .routes.utils import sanitize_filename
+    from .lib.subtitle_id_codec import encode_subtitle_id
     app.jinja_env.filters['sanitize_filename'] = lambda s: sanitize_filename(s) or ''
+    app.jinja_env.filters['b64encode'] = encode_subtitle_id
+
+    @app.context_processor
+    def inject_registration_flag():
+        return {
+            'registration_enabled': not app.config.get('DISABLE_REGISTRATION', False),
+        }
 
     @app.context_processor
     def inject_providers():
@@ -205,7 +213,7 @@ def create_app():
             'it': {'flag': '🇮🇹', 'name': 'Italiano'},
             'pt': {'flag': '🇵🇹', 'name': 'Português'},
             'pt_BR': {'flag': '🇧🇷', 'name': 'Português (BR)'},
-            'ru': {'flag': '🇷🇺', 'name': 'Русский'},
+            'ru': {'flag': '🇷🇺', 'name': 'Руѝѝкий'},
             'ja': {'flag': '🇯🇵', 'name': '日本語'},
             'zh': {'flag': '🇨🇳', 'name': '中文'},
             'tr': {'flag': '🇹🇷', 'name': 'Türkçe'},

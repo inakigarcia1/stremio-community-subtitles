@@ -52,6 +52,8 @@ class ProviderRegistry:
     async def get_active_for_user(cls, user) -> List[BaseSubtitleProvider]:
         active_providers = []
         for provider in cls._providers.values():
+            if not getattr(provider, 'include_in_parallel_search', True):
+                continue
             if await provider.is_authenticated(user):
                 active_providers.append(provider)
         return active_providers

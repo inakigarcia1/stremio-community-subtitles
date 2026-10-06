@@ -60,3 +60,34 @@ LANGUAGE_DICT = dict(LANGUAGES)
 def get_language_name(code):
     """Get language name from language code."""
     return LANGUAGE_DICT.get(code, code)
+
+
+# OpenSubtitles and the Stremio addon use these for Spanish besides ISO 639-2 `spa`.
+_SPANISH_CODES = {
+    'spa',
+    'spl',
+    'es',
+    'esp',
+    'sp',
+    'es-es',
+    'es-mx',
+    'es-419',
+    'es-ar',
+}
+
+
+def is_spanish_language(code):
+    """True for spa, spl, and codes this app already treats as Spanish."""
+    if not code:
+        return False
+    normalized = str(code).strip().lower().replace('_', '-')
+    if normalized in _SPANISH_CODES or normalized.startswith('es-'):
+        return True
+    if normalized in LANGUAGE_DICT and normalized == 'spa':
+        return True
+    try:
+        from iso639 import Lang
+        lang = Lang(normalized)
+        return lang.pt3 == 'spa' or lang.pt1 == 'es'
+    except Exception:
+        return False

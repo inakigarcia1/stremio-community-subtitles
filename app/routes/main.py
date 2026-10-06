@@ -192,7 +192,10 @@ async def account_settings():
             current_app.logger.error(f"Form validation failed: {lang_form.errors}")
             current_app.logger.error(f"Form data: {await request.form}")
         
-        all_providers = ProviderRegistry.get_all(user, filter_by_language=True)
+        all_providers = [
+            provider for provider in ProviderRegistry.get_all(user, filter_by_language=True)
+            if getattr(provider, 'listed_in_settings', True)
+        ]
         
         # Evaluate is_authenticated for each provider
         provider_status = []

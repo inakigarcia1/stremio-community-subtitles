@@ -17,6 +17,7 @@ class SubDLProvider(BaseSubtitleProvider):
     supports_hash_matching = False  # SubDL doesn't support hash matching
     can_return_ass = True  # SubDL returns ZIP files that may contain ASS
     has_additional_settings = True  # Has try_provide_ass setting
+    returns_zip = True
     
     async def authenticate(self, user, credentials: Dict[str, str]) -> Dict[str, Any]:
         """Authenticate with SubDL (validate API key)"""
@@ -83,7 +84,6 @@ class SubDLProvider(BaseSubtitleProvider):
         file_name = kwargs.get('video_filename')
         
         try:
-            # Try with IMDb ID first, fallback to film_name
             results = await client.search_subtitles(
                 api_key=api_key,
                 imdb_id=imdb_id,
@@ -94,35 +94,48 @@ class SubDLProvider(BaseSubtitleProvider):
                 type=subdl_type,
                 file_name=file_name
             )
-            
-            # Check if response indicates "can't find movie or tv"
-            if results and results.get('status') is False and "can't find movie or tv" in results.get('error', '').lower():
-                if imdb_id:
-                    try:
-                        from ...lib.metadata import get_metadata
-                        content_id = imdb_id
-                        if season and episode:
-                            content_id = f"{imdb_id}:{season}:{episode}"
-                        elif episode:
-                            content_id = f"{imdb_id}:{episode}"
-                        
-                        metadata = await get_metadata(content_id, content_type)
-                        if metadata and metadata.get('tmdb_id'):
-                            results = await client.search_subtitles(
-                                api_key=api_key,
-                                tmdb_id=metadata['tmdb_id'],
-                                languages=subdl_languages,
-                                season=season,
-                                episode=episode,
-                                type=subdl_type,
-                                file_name=file_name
-                            )
-                    except:
-                        pass
-            
-            return self._parse_results(results, season=season, episode=episode)
         except client.SubDLError as e:
+            if self._episode_lookup_failed(e) and imdb_id and episode is not None:
+                current_app.logger.info(
+                    "SubDL episode lookup returned %s for %s S%sE%s; searching the series by IMDb without that episode",
+                    e.status_code, imdb_id, season, episode,
+                )
+                return await self._search_series_without_episode(
+                    api_key, imdb_id, subdl_languages, subdl_type, file_name, season, episode
+                )
             raise ProviderSearchError(str(e), self.name, getattr(e, 'status_code', None))
+
+        if results and results.get('status') is False and "can't find movie or tv" in results.get('error', '').lower():
+            if imdb_id:
+                metadata = await self._lookup_metadata(imdb_id, season, episode, content_type)
+                episode_missing = bool(metadata and metadata.get('tmdb_episode_missing'))
+                if episode is not None and episode_missing:
+                    current_app.logger.info(
+                        "TMDB has no episode %s S%sE%s; searching SubDL by IMDb without that episode",
+                        imdb_id, season, episode,
+                    )
+                    return await self._search_series_without_episode(
+                        api_key, imdb_id, subdl_languages, subdl_type, file_name, season, episode
+                    )
+                if metadata and metadata.get('tmdb_id') and not episode_missing:
+                    try:
+                        results = await client.search_subtitles(
+                            api_key=api_key,
+                            tmdb_id=metadata['tmdb_id'],
+                            languages=subdl_languages,
+                            season=season,
+                            episode=episode,
+                            type=subdl_type,
+                            file_name=file_name
+                        )
+                    except client.SubDLError as e:
+                        if self._episode_lookup_failed(e) and episode is not None:
+                            return await self._search_series_without_episode(
+                                api_key, imdb_id, subdl_languages, subdl_type, file_name, season, episode
+                            )
+                        raise ProviderSearchError(str(e), self.name, getattr(e, 'status_code', None))
+
+        return self._parse_results(results, season=season, episode=episode)
     
     async def get_download_url(self, user, subtitle_id: str) -> str:
         """Get download URL for SubDL subtitle"""
@@ -138,6 +151,49 @@ class SubDLProvider(BaseSubtitleProvider):
         creds = await self.get_credentials(user)
         return client.get_download_url(creds['api_key'], subtitle_id)
     
+    async def _search_series_without_episode(self, api_key, imdb_id, languages, subdl_type, file_name, season, episode):
+        """Search the series by IMDb and keep items that still match the episode."""
+        try:
+            results = await client.search_subtitles(
+                api_key=api_key,
+                imdb_id=imdb_id,
+                languages=languages,
+                season=season,
+                episode=None,
+                type=subdl_type or 'tv',
+                file_name=file_name,
+            )
+        except client.SubDLError as e:
+            if season is None or not self._episode_lookup_failed(e):
+                raise ProviderSearchError(str(e), self.name, getattr(e, 'status_code', None))
+            results = await client.search_subtitles(
+                api_key=api_key,
+                imdb_id=imdb_id,
+                languages=languages,
+                season=None,
+                episode=None,
+                type=subdl_type or 'tv',
+                file_name=file_name,
+            )
+        return self._parse_results(results, season=season, episode=episode)
+
+    @staticmethod
+    def _episode_lookup_failed(error) -> bool:
+        return getattr(error, 'status_code', None) == 404
+
+    @staticmethod
+    async def _lookup_metadata(imdb_id, season, episode, content_type):
+        try:
+            from ...lib.metadata import get_metadata
+            content_id = imdb_id
+            if season and episode:
+                content_id = f"{imdb_id}:{season}:{episode}"
+            elif episode:
+                content_id = f"{imdb_id}:{episode}"
+            return await get_metadata(content_id, content_type)
+        except Exception:
+            return None
+
     def get_settings_template(self) -> str:
         """Get settings template path"""
         return 'providers/subdl_form.html'
