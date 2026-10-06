@@ -377,6 +377,7 @@ async def request_download_link(file_id, user=None):
 
     payload = {
         'file_id': file_id,
+        'sub_format': 'webvtt',
     }
 
     async def make_request():
