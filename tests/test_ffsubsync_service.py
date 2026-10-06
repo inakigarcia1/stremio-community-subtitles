@@ -75,13 +75,45 @@ def test_should_ffsubsync_skips_high_filename_score():
     )
 
 
-def test_should_ffsubsync_runs_for_low_score_with_english_reference():
+def test_should_ffsubsync_runs_when_english_filename_score_is_better():
     assert should_ffsubsync(
         {
             "match_kind": "filename",
             "filename_score": 0.2,
             "eng_provider": "opensubtitles",
             "eng_id": "1",
+            "eng_match_kind": "filename",
+            "eng_filename_score": 0.6,
+            "spa_provider": "opensubtitles",
+            "spa_id": "2",
+        }
+    )
+
+
+def test_should_ffsubsync_runs_when_english_filename_beats_a_high_spanish_score():
+    assert should_ffsubsync(
+        {
+            "match_kind": "filename",
+            "filename_score": 0.8,
+            "eng_provider": "opensubtitles",
+            "eng_id": "1",
+            "eng_match_kind": "filename",
+            "eng_filename_score": 0.9,
+            "spa_provider": "opensubtitles",
+            "spa_id": "2",
+        }
+    )
+
+
+def test_should_ffsubsync_skips_when_english_filename_score_is_not_better():
+    assert not should_ffsubsync(
+        {
+            "match_kind": "filename",
+            "filename_score": 0.5,
+            "eng_provider": "opensubtitles",
+            "eng_id": "1",
+            "eng_match_kind": "filename",
+            "eng_filename_score": 0.5,
             "spa_provider": "opensubtitles",
             "spa_id": "2",
         }

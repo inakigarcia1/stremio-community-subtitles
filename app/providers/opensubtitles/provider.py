@@ -1,11 +1,43 @@
 """OpenSubtitles provider implementation"""
 import os
 from typing import List, Dict, Optional, Any
+
+import aiohttp
 from quart import current_app
 from iso639 import Lang
 
 from ..base import BaseSubtitleProvider, SubtitleResult, ProviderAuthError, ProviderSearchError, ProviderDownloadError
+from ...lib.anime_episode_index import absolute_episode, filter_absolute_response
 from . import client as opensubtitles_client
+
+_season_counts = {}
+
+
+async def _cinemeta_season_counts(imdb_id):
+    imdb = imdb_id if str(imdb_id).startswith("tt") else f"tt{imdb_id}"
+    cached = _season_counts.get(imdb)
+    if cached is not None:
+        return cached
+    url = f"https://v3-cinemeta.strem.io/meta/series/{imdb}.json"
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=4)) as response:
+                response.raise_for_status()
+                payload = await response.json(content_type=None)
+    except Exception as exc:
+        current_app.logger.info("OpenSubtitles absolute retry skipped, cinemeta failed for %s: %s", imdb, exc)
+        return None
+    counts = {}
+    for video in (payload.get("meta") or {}).get("videos") or []:
+        try:
+            season = int(video.get("season") or 0)
+        except (TypeError, ValueError):
+            continue
+        if season < 0:
+            continue
+        counts[season] = counts.get(season, 0) + 1
+    _season_counts[imdb] = counts
+    return counts
 
 
 class OpenSubtitlesProvider(BaseSubtitleProvider):
@@ -289,8 +321,8 @@ class OpenSubtitlesProvider(BaseSubtitleProvider):
         
         try:
             results = await opensubtitles_client.search_subtitles(**search_params, user=temp_user)
-            # Pass query, season, episode for filtering when searching by title
-            return self._parse_results(results, query=query, season=season, episode=episode)
+            parsed = self._parse_results(results, query=query, season=season, episode=episode)
+            return await self._maybe_absolute_retry(temp_user, parsed, search_params, query)
         except opensubtitles_client.OpenSubtitlesError as e:
             # If auth error, try to refresh token and retry once
             if getattr(e, 'status_code', None) in (401, 403):
@@ -300,7 +332,8 @@ class OpenSubtitlesProvider(BaseSubtitleProvider):
                     # Retry with new token
                     temp_user = TempUser(creds['token'], creds['base_url'])
                     results = await opensubtitles_client.search_subtitles(**search_params, user=temp_user)
-                    return self._parse_results(results, query=query, season=season, episode=episode)
+                    parsed = self._parse_results(results, query=query, season=season, episode=episode)
+                    return await self._maybe_absolute_retry(temp_user, parsed, search_params, query)
                 except Exception as refresh_error:
                     current_app.logger.error(f"Token refresh failed: {refresh_error}")
             raise ProviderSearchError(str(e), self.name, getattr(e, 'status_code', None))
@@ -361,6 +394,40 @@ class OpenSubtitlesProvider(BaseSubtitleProvider):
         """Get settings template path"""
         return 'providers/opensubtitles_form.html'
     
+    async def _maybe_absolute_retry(self, temp_user, parsed, search_params, query):
+        """Anime often has no subs at TVDB SxE, and does at the absolute episode number."""
+        if parsed or search_params.get("type") != "episode":
+            return parsed
+        season = search_params.get("season_number")
+        episode = search_params.get("episode_number")
+        imdb_id = search_params.get("imdb_id")
+        if season is None or episode is None or not imdb_id:
+            return parsed
+        counts = await _cinemeta_season_counts(imdb_id)
+        if not counts:
+            return parsed
+        absolute = absolute_episode(counts, season, episode)
+        if not absolute or (int(season) == 1 and absolute == int(episode)):
+            return parsed
+        retry_params = {
+            "imdb_id": imdb_id,
+            "languages": search_params.get("languages"),
+            "episode_number": absolute,
+            "type": "episode",
+        }
+        try:
+            raw = await opensubtitles_client.search_subtitles(**retry_params, user=temp_user)
+        except Exception as exc:
+            current_app.logger.info("OpenSubtitles absolute retry failed for %s: %s", imdb_id, exc)
+            return parsed
+        filtered = filter_absolute_response(raw, counts)
+        kept = self._parse_results(filtered, query=query)
+        current_app.logger.info(
+            "OpenSubtitles absolute retry %s S%sE%s -> E%s kept %s",
+            imdb_id, season, episode, absolute, len(kept),
+        )
+        return kept
+
     def _convert_languages(self, languages: List[str]) -> str:
         """Convert ISO 639-3 to ISO 639-1 for OpenSubtitles"""
         converted = []

@@ -190,6 +190,28 @@ def read_embedded_reference_bytes(file_hash: str) -> Optional[Tuple[bytes, str]]
     return None
 
 
+def english_filename_not_better_reason(sync_meta: Dict[str, Any]) -> Optional[str]:
+    """Sync against a provider English sub only when its filename score beats Spanish.
+
+    An embedded English track is the file itself, and a hash match is already
+    aligned to this copy. Those are not filename guesses.
+    """
+    if sync_meta.get("eng_provider") == EMBEDDED_PROVIDER:
+        return None
+    if sync_meta.get("eng_match_kind") in {"hash", "local_hash"}:
+        return None
+    english_score = sync_meta.get("eng_filename_score")
+    spanish_score = sync_meta.get("filename_score")
+    if english_score is None or spanish_score is None:
+        return "english filename score is not better than spanish"
+    if float(english_score) <= float(spanish_score):
+        return (
+            f"english filename score {float(english_score):.4f} "
+            f"<= spanish {float(spanish_score):.4f}"
+        )
+    return None
+
+
 def ffsubsync_force_always() -> bool:
     """When true, run ffsubsync whenever ENG+SPA refs exist (local testing only)."""
     return os.environ.get("FFSUBSYNC_FORCE_ALWAYS", "").strip().lower() in {"1", "true", "yes"}
@@ -203,6 +225,15 @@ def ffsubsync_skip_reason(sync_meta: Optional[Dict[str, Any]]) -> Optional[str]:
         return "missing English reference (eng_provider/eng_id)"
     if not sync_meta.get("spa_provider") or not sync_meta.get("spa_id"):
         return "missing Spanish subtitle (spa_provider/spa_id)"
+    worse_english = english_filename_not_better_reason(sync_meta)
+    if worse_english:
+        return worse_english
+    if (
+        sync_meta.get("eng_provider") != EMBEDDED_PROVIDER
+        and sync_meta.get("eng_match_kind") not in {"hash", "local_hash"}
+        and sync_meta.get("eng_filename_score") is not None
+    ):
+        return None
     if ffsubsync_force_always():
         return None
     match_kind = sync_meta.get("match_kind")
@@ -581,6 +612,8 @@ def build_sync_metadata(active_info: Dict[str, Any], english_info: Optional[Dict
     if english_info and english_info.get("type") != "none":
         metadata["eng_provider"] = english_info.get("provider_name")
         metadata["eng_id"] = english_info.get("provider_subtitle_id")
+        metadata["eng_match_kind"] = english_info.get("match_kind")
+        metadata["eng_filename_score"] = english_info.get("filename_score")
     return metadata
 
 
